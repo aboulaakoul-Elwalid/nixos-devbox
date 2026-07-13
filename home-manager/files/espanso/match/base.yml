@@ -1,0 +1,192 @@
+# Conservative live autocorrect rules.
+# `word: true` prevents substring rewrites such as changing identifiers inside code.
+matches:
+  - trigger: "adn"
+    replace: "and"
+    word: true
+    propagate_case: true
+
+  - trigger: "alot"
+    replace: "a lot"
+    word: true
+    propagate_case: true
+
+  - trigger: "aswell"
+    replace: "as well"
+    word: true
+    propagate_case: true
+
+  - trigger: "becuase"
+    replace: "because"
+    word: true
+    propagate_case: true
+
+  - trigger: "bcause"
+    replace: "because"
+    word: true
+    propagate_case: true
+
+  - trigger: "becquse"
+    replace: "because"
+    word: true
+    propagate_case: true
+
+  - trigger: "definately"
+    replace: "definitely"
+    word: true
+    propagate_case: true
+
+  - trigger: "determninite"
+    replace: "deterministic"
+    word: true
+    propagate_case: true
+
+  - trigger: "didnt"
+    replace: "didn't"
+    word: true
+    propagate_case: true
+
+  - trigger: "dindt"
+    replace: "didn't"
+    word: true
+    propagate_case: true
+
+  - trigger: "dont"
+    replace: "don't"
+    word: true
+    propagate_case: true
+
+  - trigger: "exacly"
+    replace: "exactly"
+    word: true
+    propagate_case: true
+
+  - trigger: "happend"
+    replace: "happened"
+    word: true
+    propagate_case: true
+
+  - trigger: "hoenst"
+    replace: "honest"
+    word: true
+    propagate_case: true
+
+  - trigger: "implmentation"
+    replace: "implementation"
+    word: true
+    propagate_case: true
+
+  - trigger: "intersted"
+    replace: "interested"
+    word: true
+    propagate_case: true
+
+  - trigger: "isnt"
+    replace: "isn't"
+    word: true
+    propagate_case: true
+
+  - trigger: "langauge"
+    replace: "language"
+    word: true
+    propagate_case: true
+
+  - trigger: "occured"
+    replace: "occurred"
+    word: true
+    propagate_case: true
+
+  - trigger: "recieve"
+    replace: "receive"
+    word: true
+    propagate_case: true
+
+  - trigger: "rigourous"
+    replace: "rigorous"
+    word: true
+    propagate_case: true
+
+  - trigger: "seperate"
+    replace: "separate"
+    word: true
+    propagate_case: true
+
+  - trigger: "somethign"
+    replace: "something"
+    word: true
+    propagate_case: true
+
+  - trigger: "teh"
+    replace: "the"
+    word: true
+    propagate_case: true
+
+  - trigger: "wierd"
+    replace: "weird"
+    word: true
+    propagate_case: true
+
+  - trigger: "wich"
+    replace: "which"
+    word: true
+    propagate_case: true
+
+  - trigger: "wont"
+    replace: "won't"
+    word: true
+    propagate_case: true
+
+  # Frequent French-to-English vocabulary slips.
+  - trigger: "lexique"
+    replace: "lexicon"
+    word: true
+    propagate_case: true
+
+  - trigger: "informations"
+    replace: "information"
+    word: true
+    propagate_case: true
+
+  - trigger: "advices"
+    replace: "advice"
+    word: true
+    propagate_case: true
+
+  - trigger: "softwares"
+    replace: "software"
+    word: true
+    propagate_case: true
+
+  # Small phrase-level fixes that are unlikely to appear in code.
+  - trigger: "this two"
+    replace: "these two"
+    propagate_case: true
+
+  - trigger: "andcome"
+    replace: "and come"
+    word: true
+
+  - trigger: "auto correction"
+    replace: "autocorrection"
+    propagate_case: true
+
+  - trigger: "autoccorection"
+    replace: "autocorrection"
+    word: true
+    propagate_case: true
+
+  # Research/benchmark vocabulary shortcuts. These are explicit shortcuts, not forced rewrites.
+  - trigger: ":bb"
+    replace: "baseline bakeoff"
+
+  - trigger: ":ftax"
+    replace: "failure taxonomy"
+
+  - trigger: ":fana"
+    replace: "failure analysis"
+
+  - trigger: ":msweep"
+    replace: "model sweep"
+
+  - trigger: ":badapter"
+    replace: "benchmark adapter"

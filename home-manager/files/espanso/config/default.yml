@@ -1,0 +1,15 @@
+# Espanso live autocorrection for English prompts on Wayland.
+# Keep this conservative: broad one-letter rewrites can corrupt code and shell input.
+toggle_key: OFF
+search_shortcut: off
+show_notifications: false
+
+keyboard_layout:
+  layout: us
+
+backend: auto
+clipboard_threshold: 80
+preserve_clipboard: true
+undo_backspace: true
+backspace_limit: 8
+evdev_modifier_delay: 10

@@ -10,6 +10,7 @@
     ./modules/zellij.nix
     ./modules/dev-templates.nix
     ./modules/theme.nix
+    ./modules/tools.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the

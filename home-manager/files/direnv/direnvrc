@@ -1,0 +1,132 @@
+# direnv standard library extensions
+# https://direnv.net/man/direnv-stdlib.1.html
+
+# ------------------ Nix Integration ------------------
+# Use nix flake or shell.nix for project environment
+use_nix() {
+  watch_file shell.nix
+  watch_file flake.nix
+  watch_file flake.lock
+  
+  if [[ -f flake.nix ]]; then
+    # Use nix develop for flakes
+    local profile_dir="$(direnv_layout_dir)/nix"
+    mkdir -p "$profile_dir"
+    
+    # Check if we need to rebuild
+    local flake_fingerprint="$(nix flake metadata --json 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    local cached_fingerprint=""
+    [[ -f "$profile_dir/.fingerprint" ]] && cached_fingerprint="$(cat "$profile_dir/.fingerprint")"
+    
+    if [[ "$flake_fingerprint" != "$cached_fingerprint" ]]; then
+      log_status "nix flake changed, rebuilding..."
+      nix print-dev-env --profile "$profile_dir/profile" 2>/dev/null
+      echo "$flake_fingerprint" > "$profile_dir/.fingerprint"
+    fi
+    
+    if [[ -f "$profile_dir/profile" ]]; then
+      . "$profile_dir/profile"
+    else
+      # Fallback: direct eval (slower but works)
+      eval "$(nix print-dev-env 2>/dev/null)"
+    fi
+  elif [[ -f shell.nix ]]; then
+    # Legacy shell.nix support
+    eval "$(nix-shell --run 'export' 2>/dev/null)"
+  elif [[ -f default.nix ]]; then
+    eval "$(nix-shell --run 'export' 2>/dev/null)"
+  fi
+}
+
+# ------------------ Python Virtual Environments ------------------
+# Auto-create and activate Python venv
+layout_python() {
+  local python="${1:-python3}"
+  local venv_dir="${2:-.venv}"
+  
+  if [[ ! -d "$venv_dir" ]]; then
+    log_status "creating Python venv in $venv_dir..."
+    $python -m venv "$venv_dir"
+  fi
+  
+  source "$venv_dir/bin/activate"
+  
+  # Install requirements if present and venv was just created
+  if [[ -f requirements.txt ]]; then
+    log_status "found requirements.txt"
+  fi
+  if [[ -f pyproject.toml ]]; then
+    log_status "found pyproject.toml (use 'pip install -e .' or 'uv pip install -e .')"
+  fi
+}
+
+# Alias for common name
+layout_virtualenv() {
+  layout_python "$@"
+}
+
+# ------------------ Node.js ------------------
+# Use specific Node version via mise/asdf/nvm
+use_node() {
+  local version="${1:-}"
+  
+  if command -v mise >/dev/null 2>&1; then
+    if [[ -n "$version" ]]; then
+      log_status "using Node $version via mise"
+      eval "$(mise env -s zsh node@$version 2>/dev/null)"
+    fi
+  elif [[ -f .nvmrc ]]; then
+    log_status "found .nvmrc"
+  fi
+}
+
+# ------------------ Go ------------------
+# Set GOPATH per project
+layout_go() {
+  export GOPATH="$PWD/.go"
+  export GOBIN="$GOPATH/bin"
+  PATH_add "$GOBIN"
+}
+
+# ------------------ Rust ------------------
+# Add local cargo bin to path
+layout_rust() {
+  PATH_add "target/debug"
+  PATH_add "target/release"
+}
+
+# ------------------ AI/LLM Project Helpers ------------------
+# Load API keys from .env file (common for AI projects)
+dotenv_if_exists() {
+  if [[ -f .env ]]; then
+    dotenv
+  fi
+}
+
+# Secure: only load .env.local (gitignored) for secrets
+dotenv_local() {
+  if [[ -f .env.local ]]; then
+    dotenv .env.local
+  fi
+}
+
+# ------------------ Utility Functions ------------------
+# Add bin directory to PATH if it exists
+use_local_bin() {
+  if [[ -d bin ]]; then
+    PATH_add bin
+  fi
+  if [[ -d scripts ]]; then
+    PATH_add scripts
+  fi
+  if [[ -d .bin ]]; then
+    PATH_add .bin
+  fi
+}
+
+# Watch additional files for changes
+watch_files() {
+  for f in "$@"; do
+    watch_file "$f"
+  done
+}

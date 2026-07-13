@@ -377,6 +377,10 @@ in
     inxi
     jj
     mise
+    espanso  # not in the source machine's declared packages either (installed
+             # out-of-band) -- added here so home-manager/modules/tools.nix's
+             # espanso config actually has a binary to go with it. No autostart
+             # is wired up anywhere; run `espanso start` yourself if you want it.
     pnpm
     ruby
     ffmpeg

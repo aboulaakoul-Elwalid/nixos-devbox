@@ -1,0 +1,7 @@
+[tools]
+bun = "latest"
+java = "11"
+python = "latest"
+
+[settings]
+idiomatic_version_file_enable_tools = []
