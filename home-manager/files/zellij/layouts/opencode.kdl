@@ -1,0 +1,6 @@
+// OpenCode Main Layout - Single pane, starts opencode
+layout {
+    pane command="/home/elwalid/.opencode/bin/opencode" {
+        cwd "/home/elwalid"
+    }
+}

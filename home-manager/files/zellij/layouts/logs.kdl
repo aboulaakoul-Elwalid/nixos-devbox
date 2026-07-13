@@ -1,0 +1,14 @@
+// Dev Logs Layout - Frontend and backend log watchers
+layout {
+    pane split_direction="horizontal" {
+        pane name="frontend-logs" size="50%" {
+            cwd "/home/elwalid"
+            // You can customize the start command later
+            // command "npm" args=["run", "dev"]
+        }
+        pane name="backend-logs" size="50%" {
+            cwd "/home/elwalid"
+            // command "air" or "go run ."
+        }
+    }
+}

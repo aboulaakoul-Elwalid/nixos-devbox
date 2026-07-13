@@ -737,8 +737,8 @@ dev-help() {
 export OPENCODE_EXPERIMENTAL=1  # Enable ALL experimental features
 
 # OpenCode launcher
-alias opencode='/home/elwalid/.local/bin/opencode'
-alias oc='/home/elwalid/.local/bin/oc'
+alias opencode='$HOME/.local/bin/opencode'
+alias oc='$HOME/.local/bin/oc'
 
 # Token usage tracking (tokscale)
 alias toks='tokscale models --opencode --week --light --no-spinner'  # Quick stats
@@ -759,12 +759,12 @@ alias ocs-raw='ocsearch --raw'          # Raw output (for scripting)
 alias ocs-view='ocsearch-view'          # View session with highlighting
 
 alias agm="antigravity-manager"
-export AZURE_RESOURCE_NAME="walidaboulaakoul-kimi-resource"
+export AZURE_RESOURCE_NAME="<SET-YOUR-OWN-VALUE>"  # your Azure resource name, if you use one
 export PATH="$HOME/go/bin:$PATH"
 
 
 # Added by Antigravity CLI installer
-export PATH="/home/elwalid/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
 # Cloudflare token for Wrangler/API automation. Secret value lives outside the repo.
 if [ -f "$HOME/.config/cloudflare/env" ]; then

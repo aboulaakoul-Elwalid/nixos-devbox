@@ -7,6 +7,8 @@
     ./modules/terminals.nix
     ./modules/shell.nix
     ./modules/git.nix
+    ./modules/zellij.nix
+    ./modules/dev-templates.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the

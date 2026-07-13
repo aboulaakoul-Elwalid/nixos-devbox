@@ -1,0 +1,18 @@
+// AI Agents Layout - 2 codex panes + 1 gemini pane
+layout {
+    pane split_direction="horizontal" {
+        // Left side: 2 authenticated Codex lanes stacked
+        pane split_direction="vertical" size="66%" {
+            pane command="/home/elwalid/.local/bin/co1" name="codex-1" {
+                cwd "/home/elwalid"
+            }
+            pane command="/home/elwalid/.local/bin/co10" name="codex-10" {
+                cwd "/home/elwalid"
+            }
+        }
+        // Right side: gemini
+        pane command="/home/elwalid/.npm-global/bin/gemini" name="gemini" size="34%" {
+            cwd "/home/elwalid"
+        }
+    }
+}
