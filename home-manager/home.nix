@@ -9,6 +9,7 @@
     ./modules/git.nix
     ./modules/zellij.nix
     ./modules/dev-templates.nix
+    ./modules/theme.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the

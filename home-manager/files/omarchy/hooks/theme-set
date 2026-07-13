@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# This hook is called with the snake-cased name of the theme that has just been set.
+
+# >>> omazed hook - do not edit >>>
+if command -v omazed >/dev/null 2>&1; then
+  omazed set "$1"
+fi
+# <<< omazed hook - do not edit <<<
+
+# Keep Zed theme aligned with current Omarchy theme.
+if command -v "$HOME/.local/bin/omarchy-theme-set-zed" >/dev/null 2>&1; then
+  "$HOME/.local/bin/omarchy-theme-set-zed" "$1" >/tmp/omarchy-zed-theme.out 2>/tmp/omarchy-zed-theme.err || true
+fi
+
+# Keep OpenCode theme aligned with the current Omarchy-style palette.
+# Avoid omarchy-restart-opencode here because it re-copies the stale
+# current/theme/opencode.theme.json over the freshly generated theme.
+if [[ -x "$HOME/.local/bin/opencode-sync-theme" ]]; then
+  if "$HOME/.local/bin/opencode-sync-theme" "$1" >/tmp/opencode-theme.out 2>/tmp/opencode-theme.err; then
+    if pgrep -x opencode >/dev/null 2>&1; then
+      killall -SIGUSR2 opencode >/dev/null 2>&1 || true
+    fi
+  fi
+fi
