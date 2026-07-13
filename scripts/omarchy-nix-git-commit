@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /etc/nixos
+sudo git status --short
+read -r -p "Commit message: " msg
+if [[ -z "${msg// }" ]]; then
+  echo "No message. Aborting."
+  exit 1
+fi
+sudo git add -A
+sudo git commit -m "$msg"

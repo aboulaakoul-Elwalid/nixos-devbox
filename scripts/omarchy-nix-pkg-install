@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/run/current-system/sw/bin:$PATH"
+
+echo "Nix package install (profile-scoped)"
+echo "Example attrs: zed-editor, fd, jq, uv, claude-code"
+read -r -p "Enter nixpkgs attr(s), space-separated: " attrs
+
+if [[ -z "${attrs// }" ]]; then
+  echo "No package entered."
+  exit 0
+fi
+
+args=()
+for a in $attrs; do
+  args+=("nixpkgs#$a")
+done
+
+echo "Installing: ${args[*]}"
+nix profile install --impure "${args[@]}"
+echo "Done."

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v wifi >/dev/null 2>&1; then
+  exec wifi
+elif command -v wlctl >/dev/null 2>&1; then
+  exec omanix-launch-or-focus-tui wlctl
+elif command -v nmtui >/dev/null 2>&1; then
+  exec omanix-launch-or-focus-tui nmtui
+else
+  exec omanix-launch-wifi
+fi

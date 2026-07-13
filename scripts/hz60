@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+MON="$(hyprctl -j monitors | jq -r '.[] | select(.focused==true) | .name' | head -n1)"
+[[ -n "$MON" && "$MON" != "null" ]] || MON="$(hyprctl -j monitors | jq -r '.[0].name')"
+hyprctl keyword monitor "$MON,1920x1080@60,0x0,1" >/dev/null
+hyprctl monitors | sed -n '1,6p'

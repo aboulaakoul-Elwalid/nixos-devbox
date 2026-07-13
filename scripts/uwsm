@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Compatibility shim for configs expecting uwsm.
+# Supports: uwsm app -- <cmd...>
+if [[ "${1:-}" == "app" ]]; then
+  shift
+fi
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+exec "$@"

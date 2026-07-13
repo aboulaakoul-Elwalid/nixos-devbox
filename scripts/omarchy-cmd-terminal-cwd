@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Fallback cwd for terminal launchers.
+printf '%s\n' "${PWD:-$HOME}"

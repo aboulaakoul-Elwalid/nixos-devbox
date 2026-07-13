@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Migration shim: original omarchy first-run helper not present on NixOS.
+exit 0

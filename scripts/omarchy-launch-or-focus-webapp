@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+name="${1:-Web}"
+url="${2:-https://example.com}"
+if hyprctl clients -j 2>/dev/null | rg -qi "\"title\":\".*${name}.*\""; then
+  hyprctl dispatch focuswindow "title:${name}" >/dev/null 2>&1 || true
+  exit 0
+fi
+exec /home/elwalid/.local/bin/omarchy-launch-webapp "$url"

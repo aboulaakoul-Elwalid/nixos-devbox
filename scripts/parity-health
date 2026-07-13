@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "== Core processes =="
+echo -n "waybar count: "; (pgrep -x waybar || true) | wc -l
+echo -n "elephant count: "; (pgrep -u "$(id -u)" -x elephant || true) | wc -l
+echo -n "walker service: "; pgrep -u "$(id -u)" -f 'walker --gapplication-service' >/dev/null && echo up || echo down
+
+echo
+
+echo "== Critical commands =="
+for c in ghostty walker waybar hyprctl omarchy-launch-walker zeditor zed localsend localsend_app; do
+  if command -v "$c" >/dev/null 2>&1; then
+    echo "OK  $c -> $(command -v "$c")"
+  else
+    echo "MISS $c"
+  fi
+done
+
+echo
+
+echo "== Critical binds (SUPER SPACE/RETURN/W) =="
+hyprctl binds 2>/dev/null | awk 'BEGIN{RS="\n\n"} /modmask: 64/ && /key: SPACE|key: RETURN|key: W/ {print "-----\n"$0}' || true

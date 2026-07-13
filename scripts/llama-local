@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+model="${LLAMA_CPP_MODEL:-$HOME/Models/llama.cpp/Qwen2.5-7B-Instruct-Q4_K_M.gguf}"
+ctx="${LLAMA_CPP_CTX:-8192}"
+ngl="${LLAMA_CPP_N_GPU_LAYERS:-999}"
+threads="${LLAMA_CPP_THREADS:-10}"
+temp="${LLAMA_CPP_TEMP:-0.3}"
+top_p="${LLAMA_CPP_TOP_P:-0.9}"
+predict="${LLAMA_CPP_PREDICT:-1024}"
+llama_bin="${LLAMA_CPP_BIN:-}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  llama-local [--model PATH] [--prompt TEXT] [--prompt-file PATH] [--] [extra llama.cpp args]
+
+Environment:
+  LLAMA_CPP_MODEL          Default GGUF model path
+  LLAMA_CPP_CTX            Context size, default 8192
+  LLAMA_CPP_N_GPU_LAYERS   GPU layers, default 999
+  LLAMA_CPP_THREADS        CPU threads, default 10
+  LLAMA_CPP_TEMP           Temperature, default 0.3
+  LLAMA_CPP_TOP_P          Top-p, default 0.9
+  LLAMA_CPP_PREDICT        Max generated tokens, default 1024
+  LLAMA_CPP_BIN            llama.cpp binary/wrapper, default: ~/.local/bin/llama-vulkan when present
+EOF
+}
+
+prompt=""
+prompt_file=""
+extra=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      model="${2:-}"; shift 2 ;;
+    --prompt)
+      prompt="${2:-}"; shift 2 ;;
+    --prompt-file)
+      prompt_file="${2:-}"; shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    --)
+      shift
+      extra+=("$@")
+      break ;;
+    *)
+      extra+=("$1"); shift ;;
+  esac
+done
+
+if [[ ! -f "$model" ]]; then
+  echo "llama-local: missing model: $model" >&2
+  echo "llama-local: run llama-local-download first, or set LLAMA_CPP_MODEL" >&2
+  exit 1
+fi
+
+if [[ -n "$prompt_file" ]]; then
+  if [[ ! -f "$prompt_file" ]]; then
+    echo "llama-local: missing prompt file: $prompt_file" >&2
+    exit 1
+  fi
+  prompt="$(<"$prompt_file")"
+elif [[ -z "$prompt" && ! -t 0 ]]; then
+  prompt="$(cat)"
+fi
+
+if [[ -z "$prompt" ]]; then
+  echo "llama-local: provide --prompt, --prompt-file, or stdin" >&2
+  exit 2
+fi
+
+base_args=(
+  -m "$model"
+  -c "$ctx"
+  -ngl "$ngl"
+  -t "$threads"
+  --temp "$temp"
+  --top-p "$top_p"
+  -n "$predict"
+  --no-display-prompt
+  --single-turn
+  --no-show-timings
+  --simple-io
+  --log-disable
+  -p "$prompt"
+)
+
+if [[ -n "$llama_bin" ]]; then
+  exec "$llama_bin" "${base_args[@]}" "${extra[@]}"
+fi
+
+if [[ -x "$HOME/.local/bin/llama-vulkan" ]]; then
+  exec "$HOME/.local/bin/llama-vulkan" "${base_args[@]}" "${extra[@]}"
+fi
+
+if command -v llama >/dev/null 2>&1; then
+  exec llama "${base_args[@]}" "${extra[@]}"
+fi
+
+if [[ "${LLAMA_CPP_NIX_CUDA:-0}" == "1" ]]; then
+  exec nix shell --impure --expr 'let pkgs = import <nixpkgs> { config = { allowUnfree = true; cudaSupport = true; }; }; in pkgs.llama-cpp.override { cudaSupport = true; }' -c llama "${base_args[@]}" "${extra[@]}"
+fi
+
+exec nix shell nixpkgs#llama-cpp -c llama "${base_args[@]}" "${extra[@]}"

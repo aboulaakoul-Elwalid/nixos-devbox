@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+THEME_NAME_RAW="${1:-$(cat "$HOME/.config/omarchy/current/theme.name" 2>/dev/null || true)}"
+[[ -n "$THEME_NAME_RAW" ]] || exit 0
+
+to_title() {
+  echo "$1" | sed -E 's/(^|-)([a-z])/\1\U\2/g; s/-/ /g'
+}
+
+has_native_zed_theme() {
+  case "$1" in
+    catppuccin|catppuccin-latte|everforest|fireside|flexoki-light|gruvbox|kanagawa|matte-black|nord|osaka-jade|ristretto|rose-pine|tokyo-night)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+generate_theme_from_colors() {
+  local slug="$1"
+  local output="$2"
+  local colors_file="$HOME/.config/omarchy/current/theme/colors.toml"
+  local template_file="$HOME/.config/zed/themes/omazed.json"
+
+  [[ -f "$colors_file" && -f "$template_file" ]] || return 1
+
+  /run/current-system/sw/bin/python3 - "$colors_file" "$template_file" "$output" "$slug" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+colors_path, template_path, output_path, slug = sys.argv[1:]
+
+colors = {}
+for raw in pathlib.Path(colors_path).read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    key = key.strip()
+    value = value.strip().strip('"').strip("'").lower()
+    if re.fullmatch(r"#[0-9a-f]{6}", value):
+        colors[key] = value
+
+def c(name, fallback):
+    return colors.get(name, fallback).lower()
+
+def alpha(hex_color, aa):
+    if re.fullmatch(r"#[0-9a-f]{6}", hex_color):
+        return f"{hex_color}{aa}"
+    return hex_color
+
+bg = c("background", "#111827")
+fg = c("foreground", "#e5e7eb")
+accent = c("accent", c("color4", "#60a5fa"))
+c0 = c("color0", bg)
+c1 = c("color1", "#ef4444")
+c2 = c("color2", "#22c55e")
+c3 = c("color3", "#f59e0b")
+c4 = c("color4", accent)
+c5 = c("color5", "#d946ef")
+c6 = c("color6", "#06b6d4")
+c7 = c("color7", fg)
+c8 = c("color8", c0)
+c9 = c("color9", c1)
+c10 = c("color10", c2)
+c11 = c("color11", c3)
+c12 = c("color12", c4)
+c13 = c("color13", c5)
+c14 = c("color14", c6)
+c15 = c("color15", c7)
+sel_bg = c("selection_background", alpha(accent, "33"))
+sel_fg = c("selection_foreground", bg)
+low = alpha(fg, "14")
+mid = alpha(fg, "22")
+hi = alpha(fg, "33")
+
+data = json.loads(pathlib.Path(template_path).read_text())
+name = slug.replace("-", " ").title()
+data["name"] = name
+data["author"] = "Omarchy Generated"
+theme = data.get("themes", [{}])[0]
+theme["name"] = name
+theme["appearance"] = "dark"
+style = theme.setdefault("style", {})
+
+style_map = {
+    "background": bg,
+    "foreground": fg,
+    "border": low,
+    "border.variant": mid,
+    "border.disabled": low,
+    "elevated_surface.background": bg,
+    "text": fg,
+    "text.muted": c8,
+    "text.placeholder": c8,
+    "text.disabled": c8,
+    "text.accent": accent,
+    "icon": fg,
+    "icon.muted": c8,
+    "icon.disabled": c8,
+    "icon.placeholder": c8,
+    "icon.accent": accent,
+    "element.background": bg,
+    "element.hover": low,
+    "element.active": alpha(accent, "22"),
+    "element.selected": low,
+    "element.disabled": bg,
+    "ghost_element.background": "#00000000",
+    "ghost_element.hover": low,
+    "ghost_element.active": alpha(accent, "22"),
+    "ghost_element.selected": alpha(accent, "12"),
+    "ghost_element.disabled": "#00000000",
+    "surface.background": bg,
+    "status_bar.background": bg,
+    "editor.background": bg,
+    "editor.foreground": fg,
+    "editor.gutter.background": bg,
+    "editor.subheader.background": bg,
+    "editor.active_line.background": alpha(c8, "33"),
+    "editor.highlighted_line.background": alpha(c8, "33"),
+    "editor.line_number": c8,
+    "editor.active_line_number": fg,
+    "editor.wrap_guide": low,
+    "editor.active_wrap_guide": mid,
+    "editor.document_highlight.read_background": alpha(accent, "33"),
+    "editor.document_highlight.write_background": alpha(accent, "33"),
+    "panel.background": bg,
+    "title_bar.background": bg,
+    "title_bar.inactive_background": bg,
+    "tab_bar.background": bg,
+    "tab.inactive_background": bg,
+    "tab.active_background": bg,
+    "toolbar.background": bg,
+    "border.focused": accent,
+    "border.selected": accent,
+    "panel.focused_border": accent,
+    "pane.focused_border": accent,
+    "search.match_background": alpha(c3, "44"),
+    "scrollbar.thumb.background": mid,
+    "scrollbar.thumb.hover_background": hi,
+    "scrollbar.thumb.border": mid,
+    "scrollbar.track.background": bg,
+    "scrollbar.track.border": bg,
+    "terminal.background": bg,
+    "terminal.foreground": fg,
+    "terminal.bright_foreground": c15,
+    "terminal.dim_foreground": c8,
+    "terminal.ansi.black": c0,
+    "terminal.ansi.bright_black": c8,
+    "terminal.ansi.dim_black": c0,
+    "terminal.ansi.red": c1,
+    "terminal.ansi.bright_red": c9,
+    "terminal.ansi.dim_red": c1,
+    "terminal.ansi.green": c2,
+    "terminal.ansi.bright_green": c10,
+    "terminal.ansi.dim_green": c2,
+    "terminal.ansi.yellow": c3,
+    "terminal.ansi.bright_yellow": c11,
+    "terminal.ansi.dim_yellow": c3,
+    "terminal.ansi.blue": c4,
+    "terminal.ansi.bright_blue": c12,
+    "terminal.ansi.dim_blue": c4,
+    "terminal.ansi.magenta": c5,
+    "terminal.ansi.bright_magenta": c13,
+    "terminal.ansi.dim_magenta": c5,
+    "terminal.ansi.cyan": c6,
+    "terminal.ansi.bright_cyan": c14,
+    "terminal.ansi.dim_cyan": c6,
+    "terminal.ansi.white": c7,
+    "terminal.ansi.bright_white": c15,
+    "terminal.ansi.dim_white": c7,
+    "warning": c3,
+    "warning.background": alpha(c3, "33"),
+    "warning.border": c3,
+    "error": c1,
+    "error.background": alpha(c1, "33"),
+    "error.border": c1,
+    "success": c2,
+    "success.background": alpha(c2, "33"),
+    "success.border": c2,
+    "info": c4,
+    "info.background": alpha(c4, "33"),
+    "info.border": c4,
+    "hidden.background": bg,
+    "hidden.border": low,
+    "ignored.background": bg,
+    "ignored.border": low,
+    "predictive.background": low,
+    "predictive.border": low,
+    "link_text.hover": accent,
+}
+style.update(style_map)
+
+syntax = style.setdefault("syntax", {})
+syntax_map = {
+    "comment": c8,
+    "string": c2,
+    "number": c3,
+    "keyword": c5,
+    "function": c4,
+    "type": c6,
+    "variable": fg,
+    "variable.special": accent,
+    "tag": c1,
+}
+for k, v in syntax_map.items():
+    if isinstance(syntax.get(k), dict):
+        syntax[k]["color"] = v
+    else:
+        syntax[k] = {"color": v, "font_style": None, "font_weight": None}
+
+pathlib.Path(output_path).write_text(json.dumps(data, indent=2) + "\n")
+PY
+}
+
+candidate="$(to_title "$THEME_NAME_RAW")"
+settings="$HOME/.config/zed/settings.json"
+theme_file="$HOME/.config/zed/themes/${THEME_NAME_RAW}.json"
+omazed_theme_file="$HOME/.config/zed/themes/omazed.json"
+
+mkdir -p "$(dirname "$settings")"
+[[ -f "$settings" ]] || printf '{\n  "theme": "%s"\n}\n' "$candidate" >"$settings"
+
+# Pull exact theme display name from the local theme JSON when this theme has
+# a native handcrafted Zed file. For non-native themes, always regenerate from
+# Omarchy colors to keep Zed visually aligned with terminal/wallpaper.
+if has_native_zed_theme "$THEME_NAME_RAW" && [[ -f "$theme_file" ]]; then
+  name_from_file="$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$theme_file" | head -n1)"
+  [[ -n "$name_from_file" ]] && candidate="$name_from_file"
+else
+  generate_theme_from_colors "$THEME_NAME_RAW" "$theme_file" || true
+  if [[ -f "$theme_file" ]]; then
+    name_from_file="$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$theme_file" | head -n1)"
+    [[ -n "$name_from_file" ]] && candidate="$name_from_file"
+elif [[ -f "$omazed_theme_file" ]]; then
+  # Fallback for themes without dedicated Zed theme files.
+  candidate="Omazed"
+fi
+fi
+
+# settings.json is JSONC (often with trailing commas), so use text replacement.
+if grep -q '"theme"' "$settings"; then
+  sed -i -E "s/(\"theme\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")/\1${candidate//\//\\/}\2/" "$settings"
+else
+  sed -i "1s/{/{\\n  \\\"theme\\\": \\\"$candidate\\\",/" "$settings"
+fi

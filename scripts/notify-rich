@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app="${1:-Omarchy}"
+summary="${2:-Done}"
+body="${3:-}"
+
+case "${app,,}" in
+  codex)
+    app_name="Codex"
+    icon="com.mitchellh.ghostty"
+    ;;
+  ghostty)
+    app_name="Ghostty"
+    icon="com.mitchellh.ghostty"
+    ;;
+  omarchy)
+    app_name="Omarchy"
+    icon="preferences-desktop-theme"
+    ;;
+  *)
+    app_name="$app"
+    icon="dialog-information"
+    ;;
+esac
+
+if [[ -n "$body" ]]; then
+  exec notify-send -a "$app_name" -i "$icon" "$summary" "$body"
+else
+  exec notify-send -a "$app_name" -i "$icon" "$summary"
+fi

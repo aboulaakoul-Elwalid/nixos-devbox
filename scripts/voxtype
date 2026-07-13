@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for candidate in /run/current-system/sw/bin/voxtype "$HOME/.nix-profile/bin/voxtype"; do
+  if [[ -x "$candidate" && "$candidate" != "$0" ]]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+if [[ "${1:-}" == "record" && "${2:-}" == "toggle" ]]; then
+  exec dictate-local
+fi
+
+echo "Real voxtype is not installed yet. Rebuild NixOS or run: dictate-local-setup" >&2
+exit 1

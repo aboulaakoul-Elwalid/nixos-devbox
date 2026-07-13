@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# hyprshell watchdog — force-kills the process if it's genuinely stuck.
+# Runs every N seconds from a systemd timer.  No keyboard input needed.
+#
+# Only triggers on clear signs of unresponsiveness:
+#   1) Process in D (uninterruptible sleep) state → SIGKILL
+#   2) Socket completely unresponsive for consecutive checks → SIGKILL
+
+STATE_FILE="${XDG_RUNTIME_DIR:-/run/user/$UID}/hyprshell-watchdog.fail"
+
+PID=$(systemctl --user show -p MainPID hyprshell.service 2>/dev/null | cut -d= -f2)
+if [[ -z "$PID" || "$PID" == "0" ]]; then
+  rm -f "$STATE_FILE"
+  exit 0
+fi
+
+# --- Check 1: D state (kernel hang) ------------------------------------------
+PROC_STATE=$(awk '{print $3}' "/proc/$PID/stat" 2>/dev/null || echo "")
+if [[ "$PROC_STATE" == "D" ]]; then
+  kill -9 "$PID" 2>/dev/null || true
+  logger -t hyprshell-watchdog "killed hyprshell PID=$PID (D-state hang)"
+  rm -f "$STATE_FILE"
+  exit 0
+fi
+
+# --- Check 2: socket responsiveness ------------------------------------------
+RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr"
+ALIVE=0
+for sock in "$RUNTIME_ROOT"/*/hyprshell.sock; do
+  [[ -S "$sock" ]] || continue
+  if timeout 2 socat -u /dev/null "UNIX-CONNECT:$sock" 2>/dev/null; then
+    ALIVE=1
+    break
+  fi
+done
+
+if [[ $ALIVE -eq 0 ]]; then
+  FAIL_COUNT=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  echo "$FAIL_COUNT" > "$STATE_FILE"
+
+  if [[ $FAIL_COUNT -ge 3 ]]; then
+    kill -9 "$PID" 2>/dev/null || true
+    logger -t hyprshell-watchdog "killed hyprshell PID=$PID (socket dead ${FAIL_COUNT}x)"
+    rm -f "$STATE_FILE"
+  fi
+else
+  rm -f "$STATE_FILE"
+fi

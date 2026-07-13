@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v xkbcli >/dev/null 2>&1; then
+  exec omanix-menu-keybindings "$@"
+fi
+# Fallback: show simplified bindings list through walker dmenu
+if command -v hyprctl >/dev/null 2>&1 && command -v walker >/dev/null 2>&1; then
+  hyprctl binds | awk 'BEGIN{RS="\n\n"}
+    /dispatcher:/ {
+      mod=""; key=""; desc=""; arg="";
+      if (match($0,/modmask: [0-9]+/)) mod=substr($0,RSTART+9,RLENGTH-9);
+      if (match($0,/key: [^\n]+/)) key=substr($0,RSTART+5,RLENGTH-5);
+      if (match($0,/description: [^\n]*/)) desc=substr($0,RSTART+13,RLENGTH-13);
+      if (match($0,/arg: [^\n]*/)) arg=substr($0,RSTART+5,RLENGTH-5);
+      if (desc=="") desc=arg;
+      if (desc!="") print key "  —  " desc;
+    }' | sort -u | walker --dmenu --width 900 --maxheight 650 --minheight 200 --placeholder "Keybindings" >/dev/null
+  exit 0
+fi
+exit 1

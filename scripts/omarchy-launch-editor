@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v ghostty >/dev/null 2>&1; then
+  exec ghostty -e nvim
+elif command -v kitty >/dev/null 2>&1; then
+  exec kitty -e nvim
+else
+  exec nvim
+fi

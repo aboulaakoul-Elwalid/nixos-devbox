@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Emergency kill switch for stuck hyprshell overlays.
+# Called by Hyprland exec dispatcher — use absolute paths (minimal env).
+
+# 1) Soft-close via hyprshell socket (2s timeout).
+/run/current-system/sw/bin/timeout 2 /home/elwalid/.local/bin/hyprshell-fix close-switch 2>/dev/null || true
+
+# 2) Force-kill (SIGKILL, kernel-enforced).
+/run/current-system/sw/bin/pkill -9 -f "hyprshell run" 2>/dev/null || true
+
+# 3) Stop systemd service to prevent Restart=always.
+/run/current-system/sw/bin/systemctl --user stop hyprshell.service 2>/dev/null || true
+
+# 4) Notify.
+/run/current-system/sw/bin/notify-send -t 3000 "Hyprshell Killed" "Super+Ctrl+Delete — restart with: systemctl --user start hyprshell" 2>/dev/null || true

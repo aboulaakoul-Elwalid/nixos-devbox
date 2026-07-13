@@ -1,0 +1,90 @@
+#!/bin/bash
+#
+# zs - Zellij Session helper
+# Usage: 
+#   zs              - List sessions and attach/create interactively
+#   zs <name>       - Attach to or create session with name
+#   zs -l           - List all sessions
+#   zs -k <name>    - Kill session
+#   zs -d           - Detach current session
+#
+# This provides a simple workflow for project-based sessions
+
+set -euo pipefail
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+list_sessions() {
+    echo -e "${GREEN}=== Zellij Sessions ===${NC}"
+    zellij list-sessions 2>/dev/null || echo "No sessions"
+}
+
+attach_or_create() {
+    local name="$1"
+    # Check if session exists (active or exited)
+    if zellij list-sessions 2>/dev/null | grep -q "^${name}"; then
+        echo -e "${GREEN}Attaching to session: ${name}${NC}"
+        zellij attach "$name"
+    else
+        echo -e "${YELLOW}Creating new session: ${name}${NC}"
+        zellij --session "$name"
+    fi
+}
+
+kill_session() {
+    local name="$1"
+    echo -e "${RED}Killing session: ${name}${NC}"
+    zellij kill-session "$name"
+}
+
+# Main
+case "${1:-}" in
+    "")
+        # No args - show session picker
+        list_sessions
+        echo ""
+        echo -e "${YELLOW}Enter session name (or press Enter for default):${NC} "
+        read -r session_name
+        if [ -z "$session_name" ]; then
+            zellij
+        else
+            attach_or_create "$session_name"
+        fi
+        ;;
+    -l|--list)
+        list_sessions
+        ;;
+    -k|--kill)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: zs -k <session_name>"
+            exit 1
+        fi
+        kill_session "$2"
+        ;;
+    -d|--detach)
+        # Just run zellij detach action
+        zellij action detach
+        ;;
+    -h|--help)
+        echo "zs - Zellij Session helper"
+        echo ""
+        echo "Usage:"
+        echo "  zs              List sessions and attach/create interactively"
+        echo "  zs <name>       Attach to or create session with name"
+        echo "  zs -l           List all sessions"
+        echo "  zs -k <name>    Kill session"
+        echo "  zs -d           Detach current session"
+        echo ""
+        echo "Examples:"
+        echo "  zs opencode     Open/create session named 'opencode'"
+        echo "  zs myproject    Open/create session named 'myproject'"
+        ;;
+    *)
+        # Session name provided - attach or create
+        attach_or_create "$1"
+        ;;
+esac

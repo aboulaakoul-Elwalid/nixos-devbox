@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+MODEL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/whisper.cpp/models"
+mkdir -p "$MODEL_DIR"
+URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+OUT="$MODEL_DIR/ggml-base.en.bin"
+
+echo "Downloading model to $OUT"
+curl -fL "$URL" -o "$OUT"
+echo "Done"

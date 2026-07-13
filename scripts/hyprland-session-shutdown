@@ -1,0 +1,3 @@
+#!/bin/bash
+# Save Hyprland session on shutdown
+~/.local/bin/hyprsession --mode save-and-exit 2>/dev/null

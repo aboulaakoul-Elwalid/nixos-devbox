@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+url="${1:-https://chatgpt.com}"
+if command -v brave >/dev/null 2>&1; then
+  exec brave --new-window "$url"
+else
+  exec xdg-open "$url"
+fi

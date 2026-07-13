@@ -1,0 +1,19 @@
+# Backup/cruft file patterns (mirrors the exclusion rules used during export)
+*.bak
+*.bak-*
+*.bak.*
+*~
+*.swp
+*.orig
+*.rej
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor/session artifacts
+__pycache__/
+*.pyc
+.direnv/
+result
+result-*

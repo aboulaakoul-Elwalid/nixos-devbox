@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SYSTEMCTL="/run/current-system/sw/bin/systemctl"
+
+# Preferred: restart the systemd user services to avoid duplicate bars/wallpapers.
+if "$SYSTEMCTL" --user cat omarchy-waybar.service >/dev/null 2>&1; then
+  "$SYSTEMCTL" --user restart omarchy-swaybg.service omarchy-waybar.service
+  hyprctl reload >/dev/null 2>&1 || true
+  exit 0
+fi
+
+# Fallback: legacy manual restart (for setups without the user services).
+BG="$HOME/.config/omarchy/current/background"
+UWSM="$HOME/.local/bin/uwsm-app"
+SWAYBG="/run/current-system/sw/bin/swaybg"
+WAYBAR="/run/current-system/sw/bin/waybar"
+
+pkill -x swaybg >/dev/null 2>&1 || true
+pkill -x waybar >/dev/null 2>&1 || true
+
+if [[ -f "$BG" || -L "$BG" ]]; then
+  setsid "$UWSM" -- "$SWAYBG" -i "$BG" -m fill </dev/null >/tmp/swaybg.restart.out 2>/tmp/swaybg.restart.err &
+fi
+setsid "$UWSM" -- "$WAYBAR" </dev/null >/tmp/waybar.restart.out 2>/tmp/waybar.restart.err &
+
+hyprctl reload >/dev/null 2>&1 || true

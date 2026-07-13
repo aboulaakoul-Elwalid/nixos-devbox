@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v brave >/dev/null 2>&1; then
+  exec brave "${@}"
+elif command -v chromium >/dev/null 2>&1; then
+  exec chromium "${@}"
+else
+  exec xdg-open https://duckduckgo.com
+fi

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+strip_ext() {
+  local name="$1"
+  case "$name" in
+    *.tar.gz) printf '%s\n' "${name%.tar.gz}" ;;
+    *.tar.xz) printf '%s\n' "${name%.tar.xz}" ;;
+    *.tar.bz2) printf '%s\n' "${name%.tar.bz2}" ;;
+    *.tar.zst) printf '%s\n' "${name%.tar.zst}" ;;
+    *.tgz) printf '%s\n' "${name%.tgz}" ;;
+    *.txz) printf '%s\n' "${name%.txz}" ;;
+    *.tbz2) printf '%s\n' "${name%.tbz2}" ;;
+    *.zip|*.rar|*.7z|*.tar|*.gz|*.bz2|*.xz|*.zst) printf '%s\n' "${name%.*}" ;;
+    *) printf '%s\n' "$name" ;;
+  esac
+}
+
+next_dir() {
+  local base="$1"
+  if [[ ! -e "$base" ]]; then
+    printf '%s\n' "$base"
+    return
+  fi
+
+  local n=2
+  while [[ -e "${base}-${n}" ]]; do
+    ((n++))
+  done
+  printf '%s\n' "${base}-${n}"
+}
+
+extract_one() {
+  local archive="$1"
+  local dir name stem out
+
+  dir="$(dirname "$archive")"
+  name="$(basename "$archive")"
+  stem="$(strip_ext "$name")"
+  out="$(next_dir "${dir}/${stem}")"
+
+  mkdir -p "$out"
+
+  if ! unar -f -D -q -o "$out" "$archive"; then
+    rmdir "$out" 2>/dev/null || true
+    out="$(next_dir "${dir}/${stem}")"
+    mkdir -p "$out"
+    7zz x -y -o"$out" "$archive" >/dev/null
+  fi
+
+  notify-send "Archive extracted" "$(basename "$archive") -> $(basename "$out")"
+}
+
+for archive in "$@"; do
+  extract_one "$archive"
+done

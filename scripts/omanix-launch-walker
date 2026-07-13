@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /home/elwalid/.local/bin/omarchy-launch-walker "$@"

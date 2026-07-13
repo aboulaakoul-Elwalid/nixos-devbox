@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-up}"
+if command -v brightnessctl >/dev/null 2>&1; then
+  case "$mode" in
+    up) brightnessctl -d "*kbd_backlight*" set +10% >/dev/null 2>&1 || true ;;
+    down) brightnessctl -d "*kbd_backlight*" set 10%- >/dev/null 2>&1 || true ;;
+    cycle)
+      cur=$(brightnessctl -d "*kbd_backlight*" g 2>/dev/null || echo 0)
+      max=$(brightnessctl -d "*kbd_backlight*" m 2>/dev/null || echo 1)
+      if [ "$cur" -le 0 ]; then brightnessctl -d "*kbd_backlight*" set 50% >/dev/null 2>&1 || true
+      elif [ "$cur" -lt "$max" ]; then brightnessctl -d "*kbd_backlight*" set 100% >/dev/null 2>&1 || true
+      else brightnessctl -d "*kbd_backlight*" set 0% >/dev/null 2>&1 || true; fi ;;
+  esac
+fi
+

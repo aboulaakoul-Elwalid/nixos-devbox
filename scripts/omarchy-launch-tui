@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app="${1:-}"
+if [[ -z "$app" ]]; then
+  echo "usage: omarchy-launch-tui <command> [args...]" >&2
+  exit 1
+fi
+
+export PATH="$HOME/.local/share/omarchy/bin:$HOME/.local/bin:$PATH"
+app_id="org.omarchy.$(basename -- "$app")"
+
+exec setsid uwsm-app -- xdg-terminal-exec --app-id="$app_id" -e "$app" "${@:2}"

@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec bash "/nix/store/vfynrqf114kpxv92m3ag6ix2q07dybsv-source/pkgs/omanix-scripts/src/omanix-launch-browser.sh" "$@"

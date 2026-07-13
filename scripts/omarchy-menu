@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OMARCHY_PATH="$HOME/.local/share/omarchy"
+export PATH="$HOME/.local/share/omarchy/bin:$HOME/.local/bin:$PATH"
+
+menu_cmd="bash $OMARCHY_PATH/bin/omarchy-menu"
+
+menu_running() {
+  pgrep -f "^$menu_cmd( |$)" >/dev/null 2>&1
+}
+
+close_menu() {
+  pkill -f "^$menu_cmd( |$)" >/dev/null 2>&1 || true
+  pkill -f 'walker --dmenu' >/dev/null 2>&1 || true
+}
+
+if menu_running; then
+  close_menu
+  exit 0
+fi
+
+pkill -f 'walker --dmenu' >/dev/null 2>&1 || true
+exec "$OMARCHY_PATH/bin/omarchy-menu" "$@"

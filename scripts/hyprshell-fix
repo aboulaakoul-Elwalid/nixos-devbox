@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+close_switch() {
+  local runtime_root sock sent
+  runtime_root="${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr"
+  sent=0
+
+  # Prefer current Hyprland instance when available.
+  if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+    sock="$runtime_root/$HYPRLAND_INSTANCE_SIGNATURE/hyprshell.sock"
+    if [[ -S "$sock" ]]; then
+      printf '%s' '{"CloseSwitch":null}' | socat - "UNIX-CONNECT:$sock" >/dev/null 2>&1 || true
+      sent=1
+    fi
+  fi
+
+  # Fallback: broadcast close to all known sockets (handles stale-instance drift).
+  for sock in "$runtime_root"/*/hyprshell.sock; do
+    [[ -S "$sock" ]] || continue
+    printf '%s' '{"CloseSwitch":null}' | socat - "UNIX-CONNECT:$sock" >/dev/null 2>&1 || true
+    sent=1
+  done
+
+  [[ $sent -eq 1 ]] || exit 0
+}
+
+case "${1:-}" in
+  close-switch)
+    close_switch
+    exit 0
+    ;;
+esac
+
+echo "Restarting hyprshell service..."
+systemctl --user daemon-reload || true
+systemctl --user restart hyprshell.service
+
+echo "Checking status..."
+sleep 1
+hyprctl plugins list
+systemctl --user status hyprshell.service --no-pager | head -10
+
+echo "Done. Test Super+Tab now."

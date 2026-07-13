@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+cur="$HOME/.config/omarchy/current/theme"
+next="$HOME/.config/omarchy/current/next-theme"
+rm -rf "$next"
+cp -a "$cur" "$next"
+"$HOME/.local/share/omarchy/bin/omarchy-theme-set-templates"
+rsync -a "$next/" "$cur/"
+rm -rf "$next"

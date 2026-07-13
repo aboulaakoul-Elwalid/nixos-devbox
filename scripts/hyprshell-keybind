@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+action="${1:-}"
+
+runtime_root="${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr"
+sig="${HYPRLAND_INSTANCE_SIGNATURE:-}"
+
+resolve_sock() {
+  local sock
+  if [[ -n "$sig" ]]; then
+    sock="$runtime_root/$sig/hyprshell.sock"
+    [[ -S "$sock" ]] && { echo "$sock"; return 0; }
+  fi
+  # Fallback to newest running instance socket.
+  sock="$(ls -1dt "$runtime_root"/*/hyprshell.sock 2>/dev/null | head -1 || true)"
+  [[ -n "$sock" ]] && [[ -S "$sock" ]] && { echo "$sock"; return 0; }
+  return 1
+}
+
+send_json() {
+  local payload="$1" sock
+  sock="$(resolve_sock)" || return 1
+  printf '%s' "$payload" | socat - "UNIX-CONNECT:$sock" >/dev/null 2>&1
+}
+
+case "$action" in
+  next)
+    send_json '{"OpenSwitch":{"reverse":false}}' || true
+    ;;
+  prev)
+    send_json '{"OpenSwitch":{"reverse":true}}' || true
+    ;;
+  close)
+    send_json '{"CloseSwitch":null}' || true
+    ;;
+  *)
+    echo "usage: hyprshell-keybind {next|prev|close}" >&2
+    exit 2
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+action="${1:-}"
+step="${2:-0.25}"
+min_zoom="1.0"
+max_zoom="4.0"
+
+current="$(
+  hyprctl getoption cursor:zoom_factor -j |
+    jq -r '.float // 1.0'
+)"
+
+case "$action" in
+  in)
+    target="$(awk -v v="$current" -v step="$step" -v max="$max_zoom" 'BEGIN {
+      v += step
+      if (v > max) v = max
+      printf "%.2f", v
+    }')"
+    ;;
+  out)
+    target="$(awk -v v="$current" -v step="$step" -v min="$min_zoom" 'BEGIN {
+      v -= step
+      if (v < min) v = min
+      printf "%.2f", v
+    }')"
+    ;;
+  reset)
+    target="$min_zoom"
+    ;;
+  set)
+    target="${2:-$min_zoom}"
+    target="$(awk -v v="$target" -v min="$min_zoom" -v max="$max_zoom" 'BEGIN {
+      if (v < min) v = min
+      if (v > max) v = max
+      printf "%.2f", v
+    }')"
+    ;;
+  *)
+    printf 'usage: %s in|out|reset|set [step-or-value]\n' "$0" >&2
+    exit 2
+    ;;
+esac
+
+hyprctl keyword cursor:zoom_rigid 1 >/dev/null
+hyprctl keyword cursor:zoom_factor "$target" >/dev/null

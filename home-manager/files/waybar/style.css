@@ -1,0 +1,221 @@
+@import "../omarchy/current/theme/waybar.css";
+
+* {
+  background-color: transparent;
+  color: @foreground;
+  border: none;
+  border-radius: 0;
+  min-height: 0;
+  font-family: 'Roboto Mono', 'Symbols Nerd Font', 'JetBrainsMono Nerd Font', 'CaskaydiaMono Nerd Font';
+  font-size: 12px;
+  font-weight: normal;
+}
+
+window#waybar {
+  background-color: alpha(@background, 0.7);
+  border-radius: 0;
+  transition: background-color 200ms ease;
+}
+
+/* Module spacing */
+.modules-left {
+  margin-left: 8px;
+}
+
+.modules-right {
+  margin-right: 8px;
+}
+
+.modules-center {
+  margin: 0 8px;
+}
+
+/* Workspaces */
+#workspaces {
+  margin: 0 8px;
+}
+
+#workspaces button {
+  all: initial;
+  padding: 0 10px;
+  margin: 0 3px;
+  min-width: 20px;
+  color: alpha(@foreground, 0.6);
+  background-color: transparent;
+  transition: all 200ms ease;
+}
+
+#workspaces button.active {
+  color: @foreground;
+  background-color: alpha(@foreground, 0.1);
+  border-radius: 3px;
+}
+
+#workspaces button.urgent {
+  color: @red;
+  background-color: alpha(@red, 0.1);
+  border-radius: 3px;
+}
+
+#workspaces button:hover {
+  color: @foreground;
+  background-color: alpha(@foreground, 0.05);
+  border-radius: 3px;
+}
+
+/* Window Title */
+#window {
+  margin: 0 12px;
+  color: alpha(@foreground, 0.7);
+  font-weight: normal;
+  font-style: italic;
+}
+
+/* Clock */
+#clock {
+  margin: 0;
+  padding: 0 4px;
+  color: @foreground;
+  font-weight: 500;
+}
+
+/* System Stats */
+#cpu,
+#memory,
+#custom-gpu,
+#network,
+#pulseaudio,
+#custom-activitywatch {
+  margin: 0 6px;
+  padding: 0 4px;
+  transition: all 200ms ease;
+}
+
+#cpu:hover,
+#memory:hover,
+#custom-gpu:hover,
+#network:hover,
+#pulseaudio:hover {
+  background-color: alpha(@foreground, 0.05);
+  border-radius: 3px;
+}
+
+/* CPU */
+#cpu {
+  color: @green;
+}
+
+#cpu.warning {
+  color: @yellow;
+}
+
+#cpu.critical {
+  color: @red;
+}
+
+/* Memory */
+#memory {
+  color: @magenta;
+}
+
+#memory.warning {
+  color: @yellow;
+}
+
+#memory.critical {
+  color: @red;
+}
+
+/* GPU */
+#custom-gpu {
+  color: @blue;
+}
+
+#custom-gpu.warning {
+  color: @yellow;
+}
+
+#custom-gpu.critical {
+  color: @red;
+}
+
+/* Network */
+#network {
+  color: @cyan;
+}
+
+#network.disconnected {
+  color: @red;
+}
+
+/* Audio */
+#pulseaudio {
+  color: @blue;
+}
+
+#pulseaudio.muted {
+  color: alpha(@foreground, 0.4);
+}
+
+/* AI Credits */
+#custom-ai-credits {
+  color: @blue;
+  font-family: 'Symbols Nerd Font', 'Roboto Mono', 'JetBrainsMono Nerd Font', 'CaskaydiaMono Nerd Font';
+  margin: 0 6px 0 2px;
+  padding: 0 1px;
+  transition: all 200ms ease;
+}
+
+#custom-ai-credits:hover {
+  background-color: alpha(@foreground, 0.05);
+  border-radius: 3px;
+}
+
+#custom-ai-credits.ai-credits-ok {
+  color: @green;
+}
+
+#custom-ai-credits.ai-credits-warning {
+  color: @yellow;
+}
+
+#custom-ai-credits.ai-credits-critical {
+  color: @red;
+}
+
+/* ActivityWatch */
+#custom-activitywatch {
+  color: @green;
+  margin: 0 2px 0 4px;
+  padding: 0 1px;
+}
+
+#custom-activitywatch.idle {
+  color: alpha(@foreground, 0.5);
+}
+
+/* Tooltips */
+tooltip {
+  background-color: @background;
+  border: 1px solid alpha(@foreground, 0.2);
+  border-radius: 4px;
+  padding: 8px 12px;
+}
+
+tooltip label {
+  color: @foreground;
+}
+
+#custom-voxtype {
+  min-width: 12px;
+  margin: 0 0 0 7.5px;
+}
+
+#custom-voxtype.recording {
+  color: #a55555;
+}
+
+#custom-idle-indicator.active,
+#custom-notification-silencing-indicator.active {
+  color: #a55555;
+}

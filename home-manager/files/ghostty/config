@@ -1,0 +1,44 @@
+# Dynamic theme colors
+config-file = ?"~/.config/omarchy/current/theme/ghostty.conf"
+
+# Font
+font-family = "Roboto Mono"
+font-style = Medium
+font-size = 11
+copy-on-select = clipboard
+
+# Keep Ghostty on a simpler, crisper Linux hinting path
+freetype-load-flags = hinting
+
+
+# Window
+window-padding-x = 10
+window-padding-y = 10
+confirm-close-surface=false
+resize-overlay = never
+window-save-state = never
+scrollbar = system
+right-click-action = paste
+
+# Cursor stlying
+cursor-style = "block"
+cursor-style-blink = false
+shell-integration-features = no-cursor
+
+# Keyboard bindings
+keybind = f11=toggle_fullscreen
+keybind = shift+insert=paste_from_clipboard
+keybind = control+insert=copy_to_clipboard
+keybind = super+control+shift+alt+arrow_down=resize_split:down,100
+keybind = super+control+shift+alt+arrow_up=resize_split:up,100
+keybind = super+control+shift+alt+arrow_left=resize_split:left,100
+keybind = super+control+shift+alt+arrow_right=resize_split:right,100
+
+# Commented out for Claude Code compatibility
+# keybind = shift+enter=text:\x1b\r
+
+# Mouse scrolling (higher = faster, default is 1.0)
+mouse-scroll-multiplier = 3
+
+# Fix general slowness on hyprland (https://github.com/ghostty-org/ghostty/discussions/3224)
+async-backend = epoll

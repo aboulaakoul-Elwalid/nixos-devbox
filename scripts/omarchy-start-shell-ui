@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BG="/home/elwalid/.config/omarchy/current/background"
+WAIT="/home/elwalid/.config/systemd/scripts/wait-hypr-monitor.sh"
+UWSM="/home/elwalid/.local/bin/uwsm-app"
+WAYBAR="/run/current-system/sw/bin/waybar"
+SWAYBG="/run/current-system/sw/bin/swaybg"
+
+"$WAIT" >/dev/null 2>&1 || true
+
+if systemctl --user start omarchy-swaybg.service omarchy-waybar.service >/dev/null 2>&1; then
+  exit 0
+fi
+
+if ! pgrep -u "$USER" -f "^$SWAYBG -i $BG -m fill$" >/dev/null 2>&1; then
+  pkill -x swaybg >/dev/null 2>&1 || true
+  setsid "$UWSM" -- "$SWAYBG" -i "$BG" -m fill </dev/null >/tmp/swaybg.autostart.out 2>/tmp/swaybg.autostart.err &
+  disown || true
+fi
+
+if ! pgrep -u "$USER" -f "^$WAYBAR$" >/dev/null 2>&1; then
+  pkill -x waybar >/dev/null 2>&1 || true
+  setsid "$UWSM" -- "$WAYBAR" </dev/null >/tmp/waybar.autostart.out 2>/tmp/waybar.autostart.err &
+  disown || true
+fi

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mon=$(hyprctl monitors -j | jq -r ".[] | select(.focused==true).name" 2>/dev/null || true)
+[ -z "$mon" ] && exit 0
+scale=$(hyprctl monitors -j | jq -r ".[] | select(.focused==true).scale" 2>/dev/null || echo 1)
+if [ "$scale" = "1" ] || [ "$scale" = "1.0" ]; then
+  hyprctl keyword monitor "$mon,preferred,auto,1.25" >/dev/null 2>&1 || true
+else
+  hyprctl keyword monitor "$mon,preferred,auto,1" >/dev/null 2>&1 || true
+fi
+

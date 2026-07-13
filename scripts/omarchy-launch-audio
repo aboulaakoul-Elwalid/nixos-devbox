@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prefer explicit NixOS paths to avoid PATH/session quirks from WM keybinds.
+if [ -x /run/current-system/sw/bin/pavucontrol ]; then
+  exec /run/current-system/sw/bin/pavucontrol
+fi
+
+if command -v pavucontrol >/dev/null 2>&1; then
+  exec pavucontrol
+fi
+
+# Optional fallback for terminal mixer workflows.
+if [ -x /run/current-system/sw/bin/wiremix ] && command -v omarchy-launch-or-focus-tui >/dev/null 2>&1; then
+  exec omarchy-launch-or-focus-tui wiremix
+fi
+
+# Last-resort helper if provided by the environment.
+if command -v omanix-launch-audio >/dev/null 2>&1; then
+  exec omanix-launch-audio
+fi
+
+if command -v notify-send >/dev/null 2>&1; then
+  notify-send "Audio controls unavailable" "No supported audio panel command found"
+fi
+exit 1

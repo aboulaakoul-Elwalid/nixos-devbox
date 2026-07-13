@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  cat <<'EOF'
+Usage:
+  llm "prompt here"
+  echo "prompt here" | llm
+
+Thin wrapper around llama-local.
+EOF
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+  prompt="$*"
+elif ! [[ -t 0 ]]; then
+  prompt="$(cat)"
+else
+  echo "llm: provide a prompt argument or stdin" >&2
+  exit 2
+fi
+
+raw_file="$(mktemp -t llm.raw.XXXXXX)"
+err_file="$(mktemp -t llm.err.XXXXXX)"
+cleanup() { rm -f "$raw_file" "$err_file"; }
+trap cleanup EXIT
+
+if ! ${LLM_BACKEND:-$HOME/.local/bin/llama-local} --prompt "$prompt" >"$raw_file" 2>"$err_file"; then
+  cat "$err_file" >&2
+  exit 1
+fi
+
+python3 - "$prompt" "$raw_file" <<'PY'
+import sys
+from pathlib import Path
+
+prompt = sys.argv[1]
+raw = Path(sys.argv[2]).read_text(errors="ignore")
+
+text = raw
+pos = text.rfind(prompt)
+if pos != -1:
+    text = text[pos + len(prompt):]
+
+for marker in ["\nExiting...", "\nllama_memory_breakdown_print:", "\n[ Prompt:"]:
+    cut = text.find(marker)
+    if cut != -1:
+        text = text[:cut]
+
+lines = []
+for line in text.splitlines():
+    stripped = line.strip()
+    if not stripped:
+        if lines:
+            lines.append("")
+        continue
+    if stripped == ">":
+        continue
+    if stripped.startswith("> "):
+        continue
+    if stripped.startswith("Loading model"):
+        continue
+    if stripped in {"▄▄ ▄▄", "██ ██", "▀▀    ▀▀"}:
+        continue
+    if stripped.startswith("build      :") or stripped.startswith("model      :") or stripped.startswith("modalities :"):
+        continue
+    if stripped.startswith("available commands:"):
+        continue
+    if stripped.startswith("/exit") or stripped.startswith("/regen") or stripped.startswith("/clear") or stripped.startswith("/read") or stripped.startswith("/glob"):
+        continue
+    if "██" in stripped and "█" in stripped:
+        continue
+    lines.append(line)
+
+print("\n".join(lines).strip())
+PY

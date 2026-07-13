@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+arg="${1:-+5%}"
+if command -v brightnessctl >/dev/null 2>&1; then
+  brightnessctl set "$arg" >/dev/null || true
+fi
+

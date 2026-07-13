@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: omarchy-launch-or-focus <class> [launch-cmd]
+class="${1:-}"
+launch="${2:-}"
+if [[ -n "$class" ]] && hyprctl clients -j 2>/dev/null | rg -qi "\"class\":\"$class\""; then
+  hyprctl dispatch focuswindow "class:$class" >/dev/null 2>&1 || true
+  exit 0
+fi
+if [[ -n "$launch" ]]; then
+  exec bash -lc "$launch"
+fi
+exec "$class"

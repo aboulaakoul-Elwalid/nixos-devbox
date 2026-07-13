@@ -1,0 +1,22 @@
+[alias]
+	co = checkout
+	br = branch
+	ci = commit
+	st = status
+	smartpush = !~/bin/git-smart-push
+[pull]
+	rebase = true
+[init]
+	defaultBranch = master
+[user]
+	name = aboulaakoul-elwalid
+	email = walidaboulaakoul@gmail.com
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/run/current-system/sw/bin/gh auth git-credential
+[safe]
+	directory = /etc/nixos
+[credential]
+	helper = store
+[credential "https://github.com"]
+	helper = !/run/current-system/sw/bin/gh auth git-credential

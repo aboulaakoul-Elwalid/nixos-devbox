@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v upower >/dev/null 2>&1; then
+  dev=$(upower -e | grep -m1 battery || true)
+  if [ -n "$dev" ]; then
+    upower -i "$dev" | awk -F: '/percentage/{gsub(/ /, "", $2); print $2}' | tr -d "%"
+    exit 0
+  fi
+fi
+if [ -d /sys/class/power_supply ]; then
+  cap=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -n1 || true)
+  [ -n "$cap" ] && { echo "$cap"; exit 0; }
+fi
+echo 0
+

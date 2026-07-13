@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Ensure NVIDIA NVML libraries are visible to btop on NixOS.
+export LD_LIBRARY_PATH="/run/opengl-driver/lib:/run/opengl-driver-32/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec /run/current-system/sw/bin/btop "$@"

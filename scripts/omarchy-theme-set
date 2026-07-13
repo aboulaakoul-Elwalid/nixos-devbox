@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export OMARCHY_PATH="$HOME/.local/share/omarchy"
+export PATH="$HOME/.local/share/omarchy/bin:$HOME/.local/bin:$PATH"
+exec "$OMARCHY_PATH/bin/omarchy-theme-set" "$@"

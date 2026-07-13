@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# ~/.local/bin/sioyek-agent
+# Send selected PDF text to LLM (Ollama preferred, fallback to OpenAI-compatible)
+
+PDF_PATH="$1"
+SELECTED="$(wl-paste --no-newline --primary 2>/dev/null || wl-paste --no-newline 2>/dev/null || echo '')"
+
+# Return early if nothing was selected
+if [[ -z "$SELECTED" ]]; then
+  notify-send "Sioyek Agent" "No text selected"
+  exit 0
+fi
+
+PROMPT="Explain this concept clearly and concisely:\n\n$SELECTED"
+
+# Try Ollama first (local, offline if model is cached)
+if command -v ollama >/dev/null 2>&1; then
+  RESPONSE="$(printf "%s" "$PROMPT" | ollama run llama2 --stdin 2>/dev/null)" && AGENT_USED="ollama"
+fi
+
+# Fallback to OpenAI-compatible API (Cerebras, OpenAI, etc.)
+if [[ -z "$RESPONSE" ]]; then
+  if [[ -n "$OPENAI_API_KEY" ]]; then
+    RESPONSE="$(python3 - <<'PYTHON_END'
+import os, sys, requests, json
+
+text = """$SELECTED"""
+key = os.getenv("OPENAI_API_KEY")
+model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+api_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1")
+
+if not key:
+    print("Error: OPENAI_API_KEY not set")
+    sys.exit(1)
+
+try:
+    resp = requests.post(
+        f"{api_url}/chat/completions",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": f"Explain this concept clearly and concisely:\n\n{text}"}],
+            "max_tokens": 500
+        },
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=30
+    )
+    resp.raise_for_status()
+    print(resp.json()["choices"][0]["message"]["content"])
+except Exception as e:
+    print(f"Error: {str(e)}")
+    sys.exit(1)
+PYTHON_END
+    )" && AGENT_USED="openai-compatible"
+  fi
+fi
+
+# If we got a response, save it
+if [[ -n "$RESPONSE" ]]; then
+  NOTE_FILE="${PDF_PATH%.*}.md"
+  CONTEXT="$(echo "$SELECTED" | cut -c1-200)"
+  printf "\n### [AI EXPLANATION] %s (%s)\n> Context: %s\n\n%s\n\n" "$(date '+%Y-%m-%d %H:%M')" "$AGENT_USED" "$CONTEXT" "$RESPONSE" >> "$NOTE_FILE"
+  notify-send "Sioyek Agent" "AI explanation added to $(basename "$NOTE_FILE")"
+else
+  notify-send "Sioyek Agent" "Failed to get response. Check OPENAI_API_KEY or ollama."
+fi

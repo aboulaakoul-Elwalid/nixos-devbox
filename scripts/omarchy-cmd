@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [ $# -eq 0 ]; then
+  exec /home/elwalid/.local/bin/omarchy-menu
+fi
+sub="$1"; shift || true
+case "$sub" in
+  screenshot) exec /home/elwalid/.local/bin/omarchy-cmd-screenshot "$@" ;;
+  audio-switch) exec /home/elwalid/.local/bin/omarchy-cmd-audio-switch "$@" ;;
+  terminal-cwd) exec /home/elwalid/.local/bin/omarchy-cmd-terminal-cwd "$@" ;;
+  first-run) exec /home/elwalid/.local/bin/omarchy-cmd-first-run "$@" ;;
+  *) exec /home/elwalid/.local/bin/omarchy-menu ;;
+esac

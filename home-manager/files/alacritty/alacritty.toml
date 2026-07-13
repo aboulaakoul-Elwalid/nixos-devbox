@@ -1,0 +1,39 @@
+general.import = [ "~/.config/omarchy/current/theme/alacritty.toml" ]
+
+[env]
+TERM = "xterm-256color"
+
+[font]
+normal = { family = "Roboto Mono", style = "Medium" }
+bold = { family = "Roboto Mono" }
+italic = { family = "Roboto Mono" }
+size = 10
+
+[selection]
+save_to_clipboard = true
+
+[window]
+padding.x = 10
+padding.y = 10
+decorations = "None"
+
+[cursor]
+style = { shape = "Block", blinking = "Never" }
+
+[scrolling]
+multiplier = 3
+
+[keyboard]
+bindings = [
+{ key = "F11", action = "ToggleFullscreen" },
+{ key = "Insert", mods = "Shift", action = "Paste" },
+{ key = "Insert", mods = "Control", action = "Copy" }
+]
+
+[mouse]
+bindings = [
+{ mouse = "Right", action = "Paste" }
+]
+
+[terminal]
+osc52 = "CopyPaste"

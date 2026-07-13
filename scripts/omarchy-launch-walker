@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+sock_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/elephant"
+sock_path="$sock_dir/elephant.sock"
+
+# Keep a single dmenu instance; opening launcher again replaces the previous one.
+pkill -f 'walker --dmenu' >/dev/null 2>&1 || true
+
+service_main_pid() {
+  systemctl --user show -p MainPID --value elephant.service 2>/dev/null || true
+}
+
+cleanup_extra_elephants() {
+  local main_pid="$1"
+  local pid
+  for pid in $(pgrep -f '/elephant($| )' || true); do
+    [[ -n "$main_pid" && "$main_pid" -gt 0 && "$pid" = "$main_pid" ]] && continue
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+}
+
+systemctl --user start elephant.service >/dev/null 2>&1 || true
+main_pid="$(service_main_pid)"
+cleanup_extra_elephants "$main_pid"
+
+# Wait up to ~4s for elephant socket readiness.
+ready=0
+for _ in $(seq 1 20); do
+  main_pid="$(service_main_pid)"
+  cleanup_extra_elephants "$main_pid"
+  if systemctl --user is-active --quiet elephant.service && [ -S "$sock_path" ]; then
+    ready=1
+    break
+  fi
+  sleep 0.2
+done
+
+# Last-resort stale socket cleanup if service is still not ready.
+if [ "$ready" -ne 1 ] && [ -S "$sock_path" ] && ! pgrep -f '/elephant($| )' >/dev/null 2>&1; then
+  rm -f "$sock_path" || true
+fi
+
+# Walker expects its gapplication service in background.
+if ! pgrep -f "walker --gapplication-service" >/dev/null 2>&1; then
+  setsid walker --gapplication-service >/dev/null 2>&1 &
+  sleep 0.2
+fi
+
+exec walker --width 644 --maxheight 300 --minheight 300 "$@"

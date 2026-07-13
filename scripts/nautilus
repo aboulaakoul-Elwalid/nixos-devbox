@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+gio_modules=()
+for path in \
+  /nix/store/*-dconf-*/lib/gio/modules \
+  /nix/store/*-gvfs-*/lib/gio/modules \
+  /nix/store/*-glib-networking-*/lib/gio/modules
+do
+  [[ -d "$path" ]] && gio_modules+=("$path")
+done
+
+if (( ${#gio_modules[@]} )); then
+  joined="$(IFS=:; printf '%s' "${gio_modules[*]}")"
+  export GIO_EXTRA_MODULES="${joined}${GIO_EXTRA_MODULES:+:${GIO_EXTRA_MODULES}}"
+  dbus-update-activation-environment --systemd GIO_EXTRA_MODULES >/dev/null 2>&1 || true
+fi
+
+# Prefer real Nautilus if installed in user/system profiles.
+for real in "$HOME/.nix-profile/bin/nautilus" "/run/current-system/sw/bin/nautilus"; do
+  if [[ -x "$real" ]]; then
+    exec "$real" "$@"
+  fi
+done
+
+# Fallback: open path with desktop default app.
+if [[ "${1:-}" == "--new-window" ]]; then
+  shift
+fi
+exec xdg-open "${1:-$HOME}"

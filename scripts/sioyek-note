@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# ~/.local/bin/sioyek-note
+# Save selected text from Sioyek PDFs to markdown notes
+
+set -e
+
+PDF_PATH="$1"              # sioyek expands %{file_path}
+TYPE="${2:-note}"          # optional type (highlight/idea/summary)
+NOTE_FILE="${PDF_PATH%.*}.md"
+
+DATE=$(date '+%Y-%m-%d %H:%M')
+
+# Grab selection from Wayland clipboard
+SELECTED_TEXT="$(wl-paste --no-newline --primary 2>/dev/null || wl-paste --no-newline 2>/dev/null || echo '')"
+
+# Clean whitespace
+CLEAN="$(echo "$SELECTED_TEXT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+# Append to note file
+printf "\n### [%s] %s\n> %s\n\n" "${TYPE^^}" "$DATE" "$CLEAN" >> "$NOTE_FILE"
+
+# Notify success
+notify-send "Sioyek Note" "Saved to $(basename "$NOTE_FILE")"

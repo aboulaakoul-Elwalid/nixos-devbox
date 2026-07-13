@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -x /run/current-system/sw/bin/awatcher ]]; then
+  exec /run/current-system/sw/bin/awatcher "$@"
+fi
+
+exec /nix/store/ss86khv8gmq67aa2qn1v728a54ai76i9-awatcher-0.3.1/bin/awatcher "$@"

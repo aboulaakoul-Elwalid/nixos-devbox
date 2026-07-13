@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "${XDG_RUNTIME_DIR}/bus" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+fi
+
+ok()   { printf "[OK]   %s\n" "$*"; }
+warn() { printf "[WARN] %s\n" "$*"; }
+info() { printf "[INFO] %s\n" "$*"; }
+
+printf "Audio check at %s\n" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+for s in pipewire wireplumber pipewire-pulse; do
+  if systemctl --user is-active --quiet "$s"; then
+    ok "$s is active"
+  else
+    warn "$s is NOT active"
+  fi
+done
+
+if command -v wpctl >/dev/null 2>&1; then
+  status="$(wpctl status 2>/dev/null || true)"
+  default_line="$(printf "%s\n" "$status" | sed -n 's/^\s*0\. Audio\/Sink\s\+//p' | head -n1)"
+  if [ -n "$default_line" ]; then
+    info "default sink: $default_line"
+  else
+    warn "could not read default sink"
+  fi
+
+  if printf "%s\n" "$status" | rg -q "Built-in Audio Analog Stereo"; then
+    ok "analog sink detected"
+  else
+    warn "analog sink not detected"
+  fi
+
+  info "available sinks:"
+  printf "%s\n" "$status" | awk '
+    /^Audio$/ {in_audio=1; next}
+    /^Video$/ {in_audio=0}
+    in_audio && /Sinks:/ {in_sinks=1}
+    in_audio && /Sources:/ {in_sinks=0}
+    in_audio && in_sinks {print "  " $0}
+  '
+else
+  warn "wpctl not found"
+fi
+
+psave="$(cat /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null || echo '?')"
+psctl="$(cat /sys/module/snd_hda_intel/parameters/power_save_controller 2>/dev/null || echo '?')"
+if [ "$psave" = "0" ] && [ "$psctl" = "N" ]; then
+  ok "snd_hda_intel anti-pop params set (power_save=0, controller=N)"
+else
+  warn "snd_hda_intel params are power_save=$psave, power_save_controller=$psctl"
+fi
+
+if systemctl list-unit-files | rg -q '^rtkit-daemon\.service'; then
+  uf_state="$(systemctl show -p UnitFileState --value rtkit-daemon 2>/dev/null || echo unknown)"
+  ac_state="$(systemctl show -p ActiveState --value rtkit-daemon 2>/dev/null || echo unknown)"
+  info "rtkit-daemon: unit=$uf_state active=$ac_state"
+else
+  warn "rtkit-daemon unit not found"
+fi
+
+printf "\nIf something is wrong: run 'audio-fix' and test again.\n"

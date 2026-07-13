@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Find newest live Hyprland runtime dir
+sig="$(ls -1t /run/user/1000/hypr 2>/dev/null | head -n1 || true)"
+if [[ -z "$sig" ]]; then
+  echo "No Hyprland session found under /run/user/1000/hypr"
+  exit 1
+fi
+
+# Kill known blockers that can trap input/focus
+pkill -f '/home/elwalid/.local/share/omarchy/bin/omarchy-menu' >/dev/null 2>&1 || true
+pkill -f 'walker --dmenu' >/dev/null 2>&1 || true
+pkill -x satty >/dev/null 2>&1 || true
+
+# Ensure at least one terminal is visible/focused
+XDG_RUNTIME_DIR=/run/user/1000 HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl dispatch exec '/run/current-system/sw/bin/ghostty' >/dev/null 2>&1 || true
+
+# Print quick status
+echo "Recovered session signature: $sig"
+XDG_RUNTIME_DIR=/run/user/1000 HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl -j activewindow || true

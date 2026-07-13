@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v makoctl >/dev/null 2>&1; then
+  mode=$(makoctl mode 2>/dev/null || true)
+  if echo "$mode" | grep -qi do-not-disturb; then
+    makoctl mode -r do-not-disturb >/dev/null 2>&1 || true
+  else
+    makoctl mode -a do-not-disturb >/dev/null 2>&1 || true
+  fi
+fi
+

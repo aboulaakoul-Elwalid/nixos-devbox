@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WALKER_BIN="${WALKER_BIN:-walker}"
+THEMES_ROOT="$HOME/.config/omarchy/themes"
+CURRENT_ROOT="$HOME/.config/omarchy/current"
+CURRENT_THEME_DIR="$CURRENT_ROOT/theme"
+BG_LINK="$CURRENT_ROOT/background"
+
+choose() {
+  local title="$1"
+  local options="$2"
+  echo -e "$options" | "$WALKER_BIN" --dmenu --width 520 --minheight 1 --maxheight 640 --placeholder "$title"
+}
+
+restart_visuals() {
+  local swaybg_bin waybar_bin uwsm_app
+  swaybg_bin="$(command -v swaybg || echo /run/current-system/sw/bin/swaybg)"
+  waybar_bin="$(command -v waybar || echo /run/current-system/sw/bin/waybar)"
+  uwsm_app="$(command -v uwsm-app || echo /home/elwalid/.local/bin/uwsm-app)"
+
+  pkill -x swaybg >/dev/null 2>&1 || true
+  if [[ -L "$BG_LINK" || -f "$BG_LINK" ]]; then
+    setsid "$uwsm_app" -- "$swaybg_bin" -i "$BG_LINK" -m fill >/dev/null 2>&1 &
+  fi
+  # Waybar: do not spawn new instances here; only reload and dedupe if needed.
+  mapfile -t __wb_pids < <(ps -eo pid=,comm=,args= | awk '$2 ~ /waybar/ && $2 !~ /(bash|awk|rg)/ {print $1}' | sort -n)
+  if [[ ${#__wb_pids[@]} -gt 0 ]]; then
+    # Ask bars to reload config/styles.
+    for p in "${__wb_pids[@]}"; do
+      kill -USR2 "$p" >/dev/null 2>&1 || true
+    done
+    # Keep only one bar process.
+    if [[ ${#__wb_pids[@]} -gt 1 ]]; then
+      for ((i=1; i<${#__wb_pids[@]}; i++)); do
+        kill "${__wb_pids[$i]}" >/dev/null 2>&1 || true
+      done
+    fi
+  else
+    setsid "$uwsm_app" -- "$waybar_bin" >/dev/null 2>&1 &
+  fi
+  # Mako is managed by systemd user service; reload instead of spawning duplicates.
+  if command -v omarchy-restart-mako >/dev/null 2>&1; then
+    omarchy-restart-mako >/dev/null 2>&1 || true
+  else
+    makoctl reload >/dev/null 2>&1 || true
+  fi
+  hyprctl reload >/dev/null 2>&1 || true
+}
+
+pick_background() {
+  [[ -d "$CURRENT_THEME_DIR/backgrounds" ]] || exit 0
+  mapfile -t items < <(find "$CURRENT_THEME_DIR/backgrounds" -maxdepth 1 -type f | sort)
+  [[ ${#items[@]} -gt 0 ]] || exit 0
+
+  local menu=""
+  for p in "${items[@]}"; do
+    menu+="$(basename "$p") :: $p\n"
+  done
+
+  local sel
+  sel=$(choose "Wallpaper" "$menu")
+  [[ -n "$sel" ]] || exit 0
+  local path="${sel#* :: }"
+  [[ -f "$path" ]] || exit 0
+
+  ln -sfn "$path" "$BG_LINK"
+  restart_visuals
+}
+
+apply_theme() {
+  local name="$1"
+  local theme_set_bin
+  theme_set_bin="$(command -v omarchy-theme-set || true)"
+  [[ -n "$theme_set_bin" ]] || exit 1
+
+  # Use Omarchy native theme pipeline so all generated files stay in sync
+  # (hyprland.conf, waybar.css, ghostty.conf, mako.ini, etc).
+  "$theme_set_bin" "$name"
+
+  # Fallback repair: if template-generated files are still missing, generate
+  # them directly from colors.toml into current/theme.
+  if [[ ! -f "$CURRENT_THEME_DIR/hyprland.conf" || ! -f "$CURRENT_THEME_DIR/waybar.css" || ! -f "$CURRENT_THEME_DIR/ghostty.conf" ]]; then
+    local next_theme_dir
+    next_theme_dir="$CURRENT_ROOT/next-theme"
+    rm -rf "$next_theme_dir"
+    cp -a "$CURRENT_THEME_DIR" "$next_theme_dir"
+    OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}" "$HOME/.local/share/omarchy/bin/omarchy-theme-set-templates" || true
+    rsync -a "$next_theme_dir/" "$CURRENT_THEME_DIR/"
+    rm -rf "$next_theme_dir"
+  fi
+}
+
+pick_theme() {
+  [[ -d "$THEMES_ROOT" ]] || exit 0
+  mapfile -t themes < <(find "$THEMES_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+  [[ ${#themes[@]} -gt 0 ]] || exit 0
+
+  local menu=""
+  for t in "${themes[@]}"; do menu+="$t\n"; done
+  local sel
+  sel=$(choose "Theme" "$menu")
+  [[ -n "$sel" ]] || exit 0
+
+  apply_theme "$sel"
+}
+
+main_menu() {
+  local sel
+  sel=$(choose "Style" "Theme\nWallpaper")
+  case "${sel,,}" in
+    *theme*) pick_theme ;;
+    *wall*) pick_background ;;
+    *) exit 0 ;;
+  esac
+}
+
+case "${1:-}" in
+  background|wallpaper) pick_background ;;
+  theme) pick_theme ;;
+  *) main_menu ;;
+esac

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pass() { printf "[PASS] %s\n" "$*"; }
+warn() { printf "[WARN] %s\n" "$*"; }
+fail() { printf "[FAIL] %s\n" "$*"; }
+section() { printf "\n== %s ==\n" "$*"; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+section "Display"
+if pgrep -x Hyprland >/dev/null; then
+  if has_cmd hyprctl && hyprctl instances >/dev/null 2>&1; then
+    SIG="$(hyprctl instances | awk '/instance /{gsub(":","",$2); print $2; exit}')"
+    if [[ -n "${SIG:-}" ]]; then
+      MON_JSON="$(HYPRLAND_INSTANCE_SIGNATURE="$SIG" XDG_RUNTIME_DIR=/run/user/$(id -u) hyprctl -j monitors 2>/dev/null || true)"
+      if [[ -n "$MON_JSON" ]] && echo "$MON_JSON" | jq -e 'length>0' >/dev/null 2>&1; then
+        NAME="$(echo "$MON_JSON" | jq -r '.[0].name')"
+        W="$(echo "$MON_JSON" | jq -r '.[0].width')"
+        H="$(echo "$MON_JSON" | jq -r '.[0].height')"
+        R="$(echo "$MON_JSON" | jq -r '.[0].refreshRate')"
+        if [[ "$NAME" == "Unknown-1" || "$W" -lt 1600 ]]; then
+          fail "Display in fallback mode: ${NAME} ${W}x${H}@${R}"
+        else
+          pass "Display OK: ${NAME} ${W}x${H}@${R}"
+        fi
+      else
+        warn "Could not query Hyprland monitors JSON"
+      fi
+    else
+      warn "Could not determine Hyprland instance signature"
+    fi
+  else
+    warn "hyprctl unavailable"
+  fi
+else
+  warn "Hyprland is not running (check skipped)"
+fi
+
+section "Waybar"
+if systemctl --user is-active --quiet omarchy-waybar.service; then
+  pass "omarchy-waybar.service active"
+else
+  fail "omarchy-waybar.service not active"
+fi
+WB_COUNT="$(pgrep -c -x waybar || true)"
+if [[ "${WB_COUNT:-0}" -eq 1 ]]; then
+  pass "Single waybar process"
+else
+  warn "Waybar process count = ${WB_COUNT:-0}"
+fi
+
+section "Wi-Fi Dongle"
+if ! has_cmd lsusb; then
+  fail "lsusb not found"
+else
+  if lsusb | grep -qi '0bda:c811'; then
+    pass "Dongle in NIC mode (0bda:c811)"
+  elif lsusb | grep -qi '0bda:1a2b'; then
+    fail "Dongle in CDROM mode (0bda:1a2b). Run: wifi-fix"
+  else
+    warn "Realtek TP-Link dongle ID not detected"
+  fi
+fi
+
+section "Network"
+if has_cmd nmcli; then
+  WIFI_LINE="$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status | awk -F: '$2=="wifi"{print $0; exit}')"
+  if [[ -n "$WIFI_LINE" ]]; then
+    WIFI_STATE="$(echo "$WIFI_LINE" | awk -F: '{print $3}')"
+    WIFI_CONN="$(echo "$WIFI_LINE" | awk -F: '{print $4}')"
+    if [[ "$WIFI_STATE" == "connected" ]]; then
+      pass "Wi-Fi connected (${WIFI_CONN})"
+    else
+      warn "Wi-Fi state: ${WIFI_STATE:-unknown} (${WIFI_CONN:-no-connection})"
+    fi
+  else
+    warn "No Wi-Fi device reported by NetworkManager"
+  fi
+
+  ETH_LINE="$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status | awk -F: '$2=="ethernet"{print $0; exit}')"
+  if [[ -n "$ETH_LINE" ]]; then
+    ETH_STATE="$(echo "$ETH_LINE" | awk -F: '{print $3}')"
+    ETH_CONN="$(echo "$ETH_LINE" | awk -F: '{print $4}')"
+    if [[ "$ETH_STATE" == "connected" ]]; then
+      pass "Ethernet connected (${ETH_CONN})"
+    else
+      warn "Ethernet state: ${ETH_STATE:-unknown}"
+    fi
+  fi
+else
+  warn "nmcli not found"
+fi
+
+section "Hints"
+echo "- If dongle shows CDROM mode: run 'wifi-fix'"
+echo "- If display fallback appears: relogin once; then rerun 'postboot-check'"
