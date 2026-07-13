@@ -1,0 +1,4 @@
+interface:
+  display_name: "Explanation Style Coach"
+  short_description: "Analyze speakers into usable explanation practice"
+  default_prompt: "Use $explanation-style-coach to analyze this speaker/video and turn the style into a practical imitation guide."

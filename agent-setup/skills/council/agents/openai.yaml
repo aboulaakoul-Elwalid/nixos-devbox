@@ -1,0 +1,7 @@
+interface:
+  display_name: "Model Council"
+  short_description: "Synthesize host, Gemini, Opus, and Grok opinions"
+  default_prompt: "Use $council to gather independent host, Gemini, Opus, and Grok takes, then make one evidence-backed decision."
+
+policy:
+  allow_implicit_invocation: true

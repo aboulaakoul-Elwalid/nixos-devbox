@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multi-Agent Worktree Run"
+  short_description: "Coordinate agents with git worktrees"
+  default_prompt: "Use $multi-agent-worktree-run to coordinate this multi-agent coding task with isolated git worktrees."

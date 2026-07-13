@@ -1,0 +1,4 @@
+interface:
+  display_name: "Obsidian"
+  short_description: "Search and edit Walid's Obsidian vault."
+  default_prompt: "Use $obsidian to search, read, create, or update notes in the Obsidian vault."

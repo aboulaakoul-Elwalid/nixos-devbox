@@ -1,0 +1,7 @@
+interface:
+  display_name: "Antigravity Consult"
+  short_description: "Get a read-only Gemini or Opus second opinion"
+  default_prompt: "Use $antigravity-consult to ask Gemini or Opus for an independent take on this decision."
+
+policy:
+  allow_implicit_invocation: false
