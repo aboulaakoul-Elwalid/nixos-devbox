@@ -24,13 +24,16 @@ nixos/            NixOS system configuration (flake, configuration.nix,
                    see below)
 home-manager/      Home Manager configuration that reproduces the Hyprland
                    desktop, waybar, zellij, terminals, shell, and git config,
-                   plus the full Omarchy theme system (18 themes: color
-                   palettes, wallpapers, and per-app theming for waybar,
-                   hyprlock, mako, btop, neovim, vscode, and more -- see
-                   home-manager/modules/theme.nix). "gruvbox" is the current
-                   theme at export time; switch anytime with the
-                   omarchy-theme-set / omanix-theme-bg-next scripts in
-                   scripts/.
+                   the full Omarchy theme system (18 themes: color palettes,
+                   wallpapers, and per-app theming for waybar, hyprlock,
+                   mako, btop, neovim, vscode, and more -- see
+                   home-manager/modules/theme.nix; "gruvbox" is current at
+                   export time, switch anytime with the omarchy-theme-set /
+                   omanix-theme-bg-next scripts in scripts/), and per-app
+                   dev-tool config: Neovim (LazyVim-based -- this is what
+                   EDITOR/VISUAL point to), lazygit, lazydocker, btop,
+                   walker, mise, direnv, and espanso (see
+                   home-manager/modules/tools.nix).
 scripts/           Curated standalone desktop/dev-box utility scripts
                    (~/.local/bin on the source machine), with a README
                    describing each one
