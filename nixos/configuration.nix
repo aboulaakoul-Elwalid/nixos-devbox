@@ -270,6 +270,7 @@ in
     waybar
     wl-clipboard
     wtype
+    wlrctl
     voxtype-vulkan
     dotool
     pulseaudio
