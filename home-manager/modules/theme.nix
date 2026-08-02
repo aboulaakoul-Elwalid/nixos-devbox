@@ -27,4 +27,20 @@
   home.file.".config/mako/config".source =
     config.lib.file.mkOutOfStoreSymlink
       "${config.home.homeDirectory}/.config/omarchy/current/theme/mako.ini";
+
+  # current/theme.name is deliberately NOT in ../files/omarchy -- unlike
+  # current/background (relinked with `ln -sf`) and current/theme/* (replaced
+  # via `rsync --delete`), omarchy-theme-set writes it with a plain
+  # `echo >`, which follows a symlink and writes through it instead of
+  # replacing it. If it were nix-managed like the rest of current/, that
+  # write would hit the read-only nix store and every theme switch would
+  # fail with "Read-only file system" on a fresh deploy (only worked on the
+  # source machine because it became a real file from switches predating
+  # this module). Seed it as a real, writable file once, if missing.
+  home.activation.omarchyThemeNameBootstrap = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+    if [ ! -e "$HOME/.config/omarchy/current/theme.name" ]; then
+      run mkdir -p "$HOME/.config/omarchy/current"
+      run bash -c 'echo gruvbox > "$HOME/.config/omarchy/current/theme.name"'
+    fi
+  '';
 }
