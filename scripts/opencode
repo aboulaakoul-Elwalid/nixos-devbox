@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_OC="$HOME/.npm-global/bin/opencode"
+DISABLE_MOUSE_MODES=$'\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l'
+
+# Enable only the experimental features that are useful enough for daily use.
+export OPENCODE_EXPERIMENTAL_LSP_TOOL="${OPENCODE_EXPERIMENTAL_LSP_TOOL:-true}"
+export OPENCODE_ENABLE_EXA="${OPENCODE_ENABLE_EXA:-true}"
+
+# OpenCode 1.15.3 can leak xterm SGR mouse packets (for example
+# `[[<35;...M`) in Kitty when the TUI is started after attach/server
+# experiments. Run it in conservative xterm mode unless explicitly disabled.
+if [[ "${OPENCODE_KITTY_COMPAT:-1}" != "0" && "${TERM:-}" == "xterm-kitty" ]]; then
+  export TERM=xterm-256color
+  unset KITTY_PID KITTY_PUBLIC_KEY KITTY_WINDOW_ID KITTY_INSTALLATION_DIR
+  unset TERMINFO
+fi
+
+# Clear any mouse-reporting modes left behind by crashed/attached TUIs before
+# handing control to OpenCode.
+is_tui_invocation() {
+  [[ $# -eq 0 ]] && return 0
+
+  case "$1" in
+    completion|acp|mcp|run|debug|providers|auth|agent|upgrade|uninstall|serve|web|models|stats|export|import|github|pr|session|plugin|plug|db|-h|--help|-v|--version)
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+if [[ -t 1 ]]; then
+  printf '%s\033[?1004l' "$DISABLE_MOUSE_MODES" >/dev/tty 2>/dev/null || true
+fi
+
+# Do not keep mouse modes disabled while the TUI is alive: OpenCode uses the
+# same mouse protocol for wheel scrolling inside the alternate screen.
+
+# NixOS: some OpenCode native bindings (file watcher) are built against libstdc++.
+# Provide libstdc++ via LD_LIBRARY_PATH to avoid noisy startup errors.
+if [[ -z "${OPENCODE_NO_LIBSTDCPP_FIX:-}" ]]; then
+  CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+  CACHE_FILE="$CACHE_DIR/opencode/libstdcpp.libdir"
+  mkdir -p "$(dirname "$CACHE_FILE")" 2>/dev/null || true
+
+  LIBDIR=""
+  if [[ -f "$CACHE_FILE" ]]; then
+    LIBDIR="$(cat "$CACHE_FILE" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$LIBDIR" || ! -e "$LIBDIR/libstdc++.so.6" ]]; then
+    if command -v nix >/dev/null 2>&1; then
+      GCC_LIB_OUT="$(nix eval --raw 'nixpkgs#stdenv.cc.cc.lib.outPath' 2>/dev/null || true)"
+      if [[ -n "${GCC_LIB_OUT:-}" && -d "$GCC_LIB_OUT/lib" ]]; then
+        LIBDIR="$GCC_LIB_OUT/lib"
+        echo "$LIBDIR" > "$CACHE_FILE" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  if [[ -n "$LIBDIR" && -d "$LIBDIR" ]]; then
+    export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+fi
+
+exec "$REAL_OC" "$@"

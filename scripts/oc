@@ -1,0 +1,255 @@
+#!/run/current-system/sw/bin/bash
+# oc - OpenCode launcher with cached update checks
+# Usage: oc [opencode arguments...]
+
+set -uo pipefail
+
+# Environment workarounds for Ghostty terminal
+export GEMINI_API_KEY=
+export OPENCODE_EXPERIMENTAL=1
+
+STATE_DIR="$HOME/.local/state/opencode"
+STATUS_FILE="$STATE_DIR/update-status.json"
+RESTORE_DIR="$STATE_DIR/restore"
+LIVE_DIR="$RESTORE_DIR/live"
+AUTO_ATTACH_URL="${OPENCODE_ATTACH_URL:-http://${OPENCODE_SERVE_HOSTNAME:-127.0.0.1}:${OPENCODE_SERVE_PORT:-4099}}"
+mkdir -p "$STATE_DIR"
+
+SESSION_DIR="$(pwd -P 2>/dev/null || pwd)"
+RESTORE_INSTANCE="${OPENCODE_RESTORE_INSTANCE:-oc-$(date +%s%N)-$$}"
+RESTORE_SESSION_ID=""
+PRESERVE_RESTORE_RECORD=0
+
+for ((i = 1; i <= $#; i++)); do
+  if [[ "${!i}" == "--session" || "${!i}" == "-s" ]]; then
+    next=$((i + 1))
+    if (( next <= $# )); then
+      RESTORE_SESSION_ID="${!next}"
+    fi
+    break
+  fi
+done
+
+export OPENCODE_RESTORE_INSTANCE="$RESTORE_INSTANCE"
+export OPENCODE_RESTORE_DIRECTORY="$SESSION_DIR"
+export OPENCODE_RESTORE_PID="$$"
+
+write_restore_seed() {
+  local tmp_file
+
+  mkdir -p "$LIVE_DIR"
+  tmp_file="$(mktemp "$LIVE_DIR/${RESTORE_INSTANCE}.XXXXXX")"
+  /run/current-system/sw/bin/python3 - "$tmp_file" "$RESTORE_INSTANCE" "$SESSION_DIR" "$RESTORE_SESSION_ID" "$$" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+path, instance, directory, session_id, pid = sys.argv[1:6]
+record = {
+    "instance": instance,
+    "sessionID": session_id,
+    "directory": directory,
+    "title": "",
+    "pid": int(pid),
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(record, fh, indent=2)
+    fh.write("\n")
+PY
+  mv "$tmp_file" "$LIVE_DIR/$RESTORE_INSTANCE.json"
+}
+
+cleanup_restore_record() {
+  if [[ $PRESERVE_RESTORE_RECORD -eq 0 ]]; then
+    rm -f "$LIVE_DIR/$RESTORE_INSTANCE.json"
+  fi
+}
+
+preserve_restore_record() {
+  PRESERVE_RESTORE_RECORD=1
+}
+
+trap preserve_restore_record TERM HUP
+
+stop_child() {
+  preserve_restore_record
+  if [[ -n "${child_pid:-}" ]]; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+  fi
+}
+
+resolve_dir() {
+  local dir="$1"
+
+  [[ -d "$dir" ]] || return 1
+  (cd "$dir" >/dev/null 2>&1 && pwd -P)
+}
+
+server_reachable() {
+  local url="$1"
+  local curl_args=(-fsS --max-time 0.5)
+
+  command -v curl >/dev/null 2>&1 || return 1
+
+  if [[ -n "${OPENCODE_SERVER_PASSWORD:-}" ]]; then
+    curl_args+=(-u "${OPENCODE_SERVER_USERNAME:-opencode}:${OPENCODE_SERVER_PASSWORD}")
+  fi
+
+  curl "${curl_args[@]}" "$url/doc" >/dev/null 2>&1
+}
+
+standalone_opencode_running() {
+  ps -eo pid=,ppid=,comm=,args= 2>/dev/null | while read -r pid ppid comm args; do
+    [[ "$pid" == "$$" || "$ppid" == "$$" ]] && continue
+    [[ "$args" == *"opencode serve"* || "$args" == *"opencode attach"* ]] && continue
+    [[ "$args" == "node $HOME/.npm-global/bin/opencode" || "$args" == "$HOME/.npm-global/lib/node_modules/opencode-ai/bin/.opencode" ]] || continue
+    printf '%s %s\n' "$pid" "$args"
+  done | grep -q .
+}
+
+ensure_attach_server() {
+  local url="$1"
+  local log_dir="$STATE_DIR/log"
+  local log_file="$log_dir/opencode-serve.log"
+  local i
+
+  server_reachable "$url" && return 0
+
+  if standalone_opencode_running; then
+    printf 'OpenCode auto-attach: standalone OpenCode is already running. Close old OC sessions before starting the shared server.\n' >&2
+    return 1
+  fi
+
+  mkdir -p "$log_dir"
+  nohup "$HOME/.local/bin/opencode-serve" >>"$log_file" 2>&1 &
+
+  for ((i = 0; i < 50; i++)); do
+    server_reachable "$url" && return 0
+    sleep 0.1
+  done
+
+  return 1
+}
+
+is_passthrough_invocation() {
+  [[ $# -gt 0 ]] || return 1
+
+  case "$1" in
+    completion|acp|mcp|attach|run|debug|providers|auth|agent|upgrade|uninstall|serve|web|models|stats|export|import|github|pr|session|plugin|plug|db|-h|--help|-v|--version)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+prepare_attach_args() {
+  ATTACH_DIR="$SESSION_DIR"
+  ATTACH_ARGS=()
+
+  local project_seen=0
+  local arg
+  local dir
+
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    shift
+
+    case "$arg" in
+      -c|--continue|--fork)
+        ATTACH_ARGS+=("$arg")
+        ;;
+      -s|--session|-p|--password|-u|--username|--dir)
+        [[ $# -gt 0 ]] || return 1
+        if [[ "$arg" == "--dir" ]]; then
+          dir="$(resolve_dir "$1")" || return 1
+          ATTACH_DIR="$dir"
+        else
+          ATTACH_ARGS+=("$arg" "$1")
+        fi
+        shift
+        ;;
+      --session=*|--password=*|--username=*)
+        ATTACH_ARGS+=("$arg")
+        ;;
+      --dir=*)
+        dir="$(resolve_dir "${arg#--dir=}")" || return 1
+        ATTACH_DIR="$dir"
+        ;;
+      --)
+        return 1
+        ;;
+      -*)
+        return 1
+        ;;
+      *)
+        [[ $project_seen -eq 0 ]] || return 1
+        dir="$(resolve_dir "$arg")" || return 1
+        ATTACH_DIR="$dir"
+        project_seen=1
+        ;;
+    esac
+  done
+
+  return 0
+}
+
+launch_opencode() {
+  if [[ "${OPENCODE_AUTO_ATTACH:-1}" != "0" ]] && ! is_passthrough_invocation "$@" && prepare_attach_args "$@"; then
+    if ensure_attach_server "$AUTO_ATTACH_URL"; then
+      opencode attach "$AUTO_ATTACH_URL" --log-level "${OPENCODE_ATTACH_LOG_LEVEL:-WARN}" --dir "$ATTACH_DIR" "${ATTACH_ARGS[@]}"
+      return $?
+    fi
+
+    printf 'OpenCode auto-attach: %s is not reachable; refusing standalone fallback to avoid SQLite lock contention.\n' "$AUTO_ATTACH_URL" >&2
+    return 75
+  fi
+
+  opencode "$@"
+}
+
+# Main logic
+main() {
+  local rc
+  local child_pid
+
+  if is_passthrough_invocation "$@"; then
+    launch_opencode "$@"
+    return $?
+  fi
+
+  write_restore_seed
+
+  if [[ -f "$HOME/.local/bin/oc-update-check" ]]; then
+    /run/current-system/sw/bin/bash "$HOME/.local/bin/oc-update-check" --quiet --no-notify >/dev/null 2>&1 || true
+  fi
+
+  if [[ -f "$STATUS_FILE" ]]; then
+    /run/current-system/sw/bin/python3 - "$STATUS_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+parts = []
+if data["cli"]["update_available"]:
+    parts.append(f"CLI {data['cli']['current']} -> {data['cli']['latest']}")
+if data["desktop"]["update_available"]:
+    parts.append(f"Desktop {data['desktop']['current']} -> {data['desktop']['latest']}")
+
+if parts:
+    print("Update available: " + "; ".join(parts) + ". Run: oc-update")
+PY
+  fi
+
+  trap stop_child TERM HUP INT
+  launch_opencode "$@"
+  rc=$?
+
+  cleanup_restore_record
+  return "$rc"
+}
+
+main "$@"

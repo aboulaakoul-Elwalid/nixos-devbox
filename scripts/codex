@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Plain launcher for the npm-installed codex CLI. elwalid's own ~/.local/bin/codex
+# wraps codex-lane, a personal multi-account load-balancer -- not included here,
+# not needed for a single-account setup.
+exec "$HOME/.npm-global/bin/codex" "$@"

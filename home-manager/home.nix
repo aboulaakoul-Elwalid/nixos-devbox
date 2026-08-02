@@ -15,6 +15,7 @@
     ./modules/omarchy-default.nix
     ./modules/hyprshell.nix
     ./modules/oh-my-zsh.nix
+    ./modules/npm.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the
