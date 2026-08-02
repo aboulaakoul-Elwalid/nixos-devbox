@@ -348,6 +348,9 @@ in
     nautilus
     nautilus-python
     stow
+    ast-grep
+    qalculate-gtk
+    yt-dlp
     tree-sitter
     typst
     tinymist

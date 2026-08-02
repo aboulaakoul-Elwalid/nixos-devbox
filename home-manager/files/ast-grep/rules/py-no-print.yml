@@ -1,0 +1,10 @@
+# Rule: Find Python print statements (debug leftovers)
+id: no-print-debug
+message: "Remove print() debug statement"
+severity: hint
+language: python
+rule:
+  pattern: print($$$ARGS)
+note: |
+  Print statements are often left over from debugging.
+  Consider using logging module instead.

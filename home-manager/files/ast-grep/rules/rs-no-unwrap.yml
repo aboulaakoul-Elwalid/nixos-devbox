@@ -1,0 +1,13 @@
+# Rule: Find Rust unwrap() calls (potential panics)
+id: no-unwrap
+message: "Avoid unwrap() - use expect() or proper error handling"
+severity: warning
+language: rust
+rule:
+  pattern: $EXPR.unwrap()
+note: |
+  unwrap() can cause panics. Consider:
+  - .expect("descriptive message")
+  - .unwrap_or(default)
+  - .unwrap_or_else(|| ...)
+  - ? operator for propagating errors

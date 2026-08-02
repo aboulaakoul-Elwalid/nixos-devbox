@@ -1,0 +1,15 @@
+# ast-grep global configuration
+# https://ast-grep.github.io/reference/sgconfig.html
+#
+# This is a USER-LEVEL config. For project-specific configs,
+# create sgconfig.yml in your project root.
+
+ruleDirs:
+  - ~/.config/ast-grep/rules
+
+# Test configuration
+testConfigs:
+  - testDir: tests
+
+# Language-specific settings
+# (ast-grep auto-detects languages by file extension)

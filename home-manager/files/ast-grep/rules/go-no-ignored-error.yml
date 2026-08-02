@@ -1,0 +1,13 @@
+# Rule: Find Go error handling that ignores errors
+id: no-ignored-error
+message: "Error is being ignored - handle or explicitly ignore with _"
+severity: warning  
+language: go
+rule:
+  pattern: $VAR, _ := $FUNC($$$)
+  constraints:
+    FUNC:
+      regex: ".*"  # Match any function
+note: |
+  Errors should be explicitly handled in Go.
+  If intentionally ignoring, use a comment to explain why.

@@ -1,0 +1,10 @@
+# Rule: Find console.log statements (should remove before production)
+id: no-console-log
+message: "Remove console.log before committing"
+severity: warning
+language: typescript
+rule:
+  pattern: console.log($$$ARGS)
+note: |
+  Console.log statements should be removed in production code.
+  Use a proper logging library instead.
