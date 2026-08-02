@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Omarchy full-theme rotation
+Requires=omarchy-theme-rotate.service
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

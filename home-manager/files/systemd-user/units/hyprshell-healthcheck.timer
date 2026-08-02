@@ -1,0 +1,13 @@
+[Unit]
+Description=Hyprshell Health Check Timer
+PartOf=graphical-session.target
+
+[Timer]
+# Run 60 seconds after graphical session starts (give hyprshell time to initialize)
+# Then every 30 seconds
+OnStartupSec=60s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=graphical-session.target

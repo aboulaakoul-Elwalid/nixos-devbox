@@ -1,0 +1,16 @@
+[Unit]
+Description=Omarchy wallpaper service (swaybg)
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionPathExists=%h/.config/omarchy/current/background
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=%h/.config/systemd/scripts/wait-hypr-monitor.sh
+ExecStart=/run/current-system/sw/bin/swaybg -i %h/.config/omarchy/current/background -m fill
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

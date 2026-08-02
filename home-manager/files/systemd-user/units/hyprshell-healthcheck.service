@@ -1,0 +1,15 @@
+[Unit]
+Description=Hyprshell Health Check
+# Checks if hyprshell can communicate with Hyprland
+PartOf=graphical-session.target
+# Don't use Requires - we don't want to cascade failures
+After=hyprshell.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/systemd/scripts/hyprshell-healthcheck.sh
+# Inherit the graphical session environment (includes HYPRLAND_INSTANCE_SIGNATURE)
+Environment=NO_AT_BRIDGE=1
+
+[Install]
+WantedBy=graphical-session.target

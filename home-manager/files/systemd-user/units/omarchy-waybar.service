@@ -1,0 +1,15 @@
+[Unit]
+Description=Omarchy waybar service
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=%h/.config/systemd/scripts/wait-hypr-monitor.sh
+ExecStart=/run/current-system/sw/bin/waybar
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

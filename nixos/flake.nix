@@ -27,8 +27,13 @@
 				# home.username in ../home-manager/home.nix.
 				home-manager.useGlobalPkgs = true;
 				home-manager.useUserPackages = true;
-				home-manager.sharedModules = [ omanix.homeManagerModules.default ];
-					home-manager.users.elwalid = import ../home-manager/home.nix;
+				# Deliberately NOT importing omanix.homeManagerModules.default here.
+				# It ships its own separate theme/waybar/mako system that conflicts
+				# with home-manager/modules/theme.nix (the omarchy/ directory
+				# approach) and systemd-user-services.nix (the actual services this
+				# machine uses) -- see the comment at the top of
+				# systemd-user-services.nix for what those really are and why.
+				home-manager.users.elwalid = import ../home-manager/home.nix;
 			})
 			];
 		};

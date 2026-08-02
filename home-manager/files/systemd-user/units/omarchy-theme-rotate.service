@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate Omarchy to the next full theme (wallpaper + terminal + editor + waybar)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-theme-rotate-daily

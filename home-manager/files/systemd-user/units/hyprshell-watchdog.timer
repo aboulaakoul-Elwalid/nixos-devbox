@@ -1,0 +1,10 @@
+[Unit]
+Description=hyprshell watchdog timer
+
+[Timer]
+OnActiveSec=5s
+OnUnitActiveSec=10s
+Unit=hyprshell-watchdog.service
+
+[Install]
+WantedBy=timers.target

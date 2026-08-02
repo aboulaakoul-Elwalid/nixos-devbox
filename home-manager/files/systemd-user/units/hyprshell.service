@@ -1,0 +1,31 @@
+[Unit]
+Description=hyprshell - Workspace and Window Switcher
+Documentation=https://github.com/H3rmt/hyprshell
+PartOf=graphical-session.target
+After=graphical-session.target hyprland.service
+OnFailure=hyprshell-restart.service
+
+[Service]
+Type=simple
+# Disable accessibility bridge to prevent GTK registration failures
+Environment=NO_AT_BRIDGE=1
+Environment=GTK_A11Y=none
+Environment=HYPRSHELL_NO_USE_PLUGIN=1
+# Avoid GTK4's Vulkan renderer path, which crashed in libnvidia-glcore after unlock.
+Environment=GSK_RENDERER=gl
+# Allow plugin build - Hyprland 0.53.1 has correct headers now
+# The plugin enables proper close-on-key-release behavior
+# Ensure stale sockets/locks are cleared and Hyprland IPC is responsive
+ExecStartPre=%h/.config/systemd/scripts/hyprshell-prestart.sh
+ExecStart=/run/current-system/sw/bin/hyprshell run
+Restart=always
+RestartSec=3
+TimeoutStartSec=75
+TimeoutStopSec=10
+# Kill and restart on any failure
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

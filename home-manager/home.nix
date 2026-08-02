@@ -11,6 +11,7 @@
     ./modules/dev-templates.nix
     ./modules/theme.nix
     ./modules/tools.nix
+    ./modules/systemd-user-services.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the

@@ -1,0 +1,7 @@
+[Unit]
+Description=hyprshell watchdog — force-restarts stuck hyprshell
+After=hyprshell.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hyprshell-watchdog

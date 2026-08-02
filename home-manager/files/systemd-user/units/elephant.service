@@ -1,0 +1,13 @@
+
+[Unit]
+Description=Elephant
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/run/current-system/sw/bin/elephant
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+							
