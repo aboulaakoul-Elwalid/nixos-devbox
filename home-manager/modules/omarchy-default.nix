@@ -37,4 +37,20 @@
     source = ../files/omarchy-default/walker;
     recursive = true;
   };
+
+  # Elephant (walker's search backend) loads menu providers as Lua files
+  # from ~/.config/elephant/menus/ -- it does NOT scan
+  # ~/.local/share/omarchy/default/elephant/ on its own. On the source
+  # machine these are symlinks from the config dir into the omarchy data
+  # tree above. Without this, SUPER+SPACE -> Style -> Theme (and the
+  # Background picker) show an empty walker menu, since elephant has no
+  # "omarchythemes"/"omarchyBackgroundSelector" provider registered.
+  xdg.dataFile."omarchy/default/elephant" = {
+    source = ../files/omarchy-default/elephant;
+    recursive = true;
+  };
+  xdg.configFile."elephant/menus/omarchy_themes.lua".source =
+    ../files/omarchy-default/elephant/omarchy_themes.lua;
+  xdg.configFile."elephant/menus/omarchy_background_selector.lua".source =
+    ../files/omarchy-default/elephant/omarchy_background_selector.lua;
 }
