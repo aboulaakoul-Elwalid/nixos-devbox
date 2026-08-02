@@ -45,5 +45,12 @@
     ../files/wireplumber/wireplumber.conf.d/51-disable-audio-suspend.conf;
 
   home.file.".config/xournalpp/settings.xml".source = ../files/xournalpp/settings.xml;
+
+  # yt-dlp itself is deliberately NOT in nixos/configuration.nix's package
+  # list -- this nixpkgs' yt-dlp builds "master" from source and pulls in a
+  # Deno/rusty-v8 JS-engine dependency (~800MB download, ~7GB unpacked,
+  # includes building an LLVM toolchain), wildly disproportionate for a
+  # 1-line config file. The config is still here for whenever yt-dlp gets
+  # installed (manually, or once nixpkgs ships a lighter build).
   home.file.".config/yt-dlp/config".source = ../files/yt-dlp/config;
 }
