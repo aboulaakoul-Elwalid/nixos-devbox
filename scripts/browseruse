@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# browser-use CLI wrapper for NixOS
+# Points Playwright's browser search at a fake directory symlinked to system Chromium,
+# bypassing Playwright's installer entirely.
+export PLAYWRIGHT_BROWSERS_PATH=/home/elwalid/.local/share/browser-use-browsers
+export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+exec /run/current-system/sw/bin/uvx --from 'browser-use[cli]' browser-use "$@"

@@ -1,0 +1,155 @@
+#!/bin/bash
+# oc-sandbox - Lightweight sandbox for untrusted commands
+# Uses bubblewrap (fast) or docker (full isolation)
+
+set -euo pipefail
+
+MODE="bwrap"
+NETWORK_BWRAP="--unshare-net"
+NETWORK_DOCKER="--network none"
+ALLOW_NET=false
+CMD=""
+WORKDIR=""
+BIND_DIRS=()
+
+usage() {
+    cat <<EOF
+Usage: oc-sandbox [OPTIONS] <command>
+
+Run commands in an isolated sandbox environment.
+
+OPTIONS:
+  --bwrap      Use bubblewrap (default, fast, ~50ms startup)
+  --docker     Use Docker container (slower, full isolation)
+  --net        Allow network access (blocked by default)
+  --bind DIR   Mount directory read-write (can repeat)
+  --workdir D  Set working directory inside sandbox
+  -h, --help   Show this help
+
+EXAMPLES:
+  oc-sandbox echo "Hello from sandbox"
+  oc-sandbox --net curl https://example.com
+  oc-sandbox --docker npm install sketchy-package
+  oc-sandbox --bind /tmp/output --workdir /tmp/output python script.py
+
+SECURITY:
+  - Filesystem: Read-only root, tmpfs /tmp and /home
+  - Network: Blocked by default
+  - Privileges: Dropped, no escalation possible
+  - Cleanup: Automatic on exit
+EOF
+    exit 0
+}
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bwrap)
+            MODE="bwrap"
+            shift
+            ;;
+        --docker)
+            MODE="docker"
+            shift
+            ;;
+        --net)
+            NETWORK_BWRAP=""
+            NETWORK_DOCKER=""
+            ALLOW_NET=true
+            shift
+            ;;
+        --bind)
+            BIND_DIRS+=("$2")
+            shift 2
+            ;;
+        --workdir)
+            WORKDIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            CMD="$*"
+            break
+            ;;
+    esac
+done
+
+if [[ -z "$CMD" ]]; then
+    echo "Error: No command specified"
+    usage
+fi
+
+# Build bind mount args
+BWRAP_BINDS=""
+DOCKER_BINDS=""
+for dir in "${BIND_DIRS[@]}"; do
+    if [[ -d "$dir" ]]; then
+        BWRAP_BINDS+=" --bind $dir $dir"
+        DOCKER_BINDS+=" -v $dir:$dir:rw"
+    else
+        echo "Warning: Directory $dir does not exist, skipping"
+    fi
+done
+
+case "$MODE" in
+    bwrap)
+        echo "[sandbox] Running in bubblewrap (bwrap)..."
+        
+        # Build command
+        BWRAP_CMD="bwrap"
+        BWRAP_CMD+=" --ro-bind /usr /usr"
+        BWRAP_CMD+=" --ro-bind /bin /bin"
+        [[ -d /lib ]] && BWRAP_CMD+=" --ro-bind /lib /lib"
+        [[ -d /lib64 ]] && BWRAP_CMD+=" --ro-bind /lib64 /lib64"
+        # Bind essential /etc files
+        # When network is enabled, use upstream DNS resolver (not systemd stub)
+        if [[ "$ALLOW_NET" == "true" && -f /run/systemd/resolve/resolv.conf ]]; then
+            # Bind /etc read-only but override resolv.conf with upstream DNS
+            for f in /etc/*; do
+                [[ -e "$f" && "$(basename "$f")" != "resolv.conf" ]] && BWRAP_CMD+=" --ro-bind $f $f"
+            done
+            BWRAP_CMD+=" --ro-bind /run/systemd/resolve/resolv.conf /etc/resolv.conf"
+        else
+            [[ -d /etc ]] && BWRAP_CMD+=" --ro-bind /etc /etc"
+        fi
+        BWRAP_CMD+=" --tmpfs /tmp"
+        BWRAP_CMD+=" --tmpfs /home"
+        BWRAP_CMD+=" --proc /proc"
+        BWRAP_CMD+=" --dev /dev"
+        # Only unshare user if network is blocked (user namespace breaks network)
+        [[ "$ALLOW_NET" == "false" ]] && BWRAP_CMD+=" --unshare-user"
+        BWRAP_CMD+=" --unshare-pid"
+        [[ -n "$NETWORK_BWRAP" ]] && BWRAP_CMD+=" $NETWORK_BWRAP"
+        BWRAP_CMD+=" --die-with-parent"
+        BWRAP_CMD+="$BWRAP_BINDS"
+        [[ -n "$WORKDIR" ]] && BWRAP_CMD+=" --chdir $WORKDIR"
+        BWRAP_CMD+=" /bin/sh -c \"$CMD\""
+        
+        eval "$BWRAP_CMD"
+        ;;
+        
+    docker)
+        echo "[sandbox] Running in Docker container..."
+        
+        DOCKER_CMD="docker run --rm"
+        DOCKER_CMD+=" ${NETWORK_DOCKER:---network none}"
+        DOCKER_CMD+=" --read-only"
+        DOCKER_CMD+=" --tmpfs /tmp:rw,exec,size=1g"
+        DOCKER_CMD+=" --tmpfs /home:rw,exec,size=512m"
+        DOCKER_CMD+=" --security-opt no-new-privileges"
+        DOCKER_CMD+=" --cap-drop ALL"
+        DOCKER_CMD+="$DOCKER_BINDS"
+        [[ -n "$WORKDIR" ]] && DOCKER_CMD+=" -w $WORKDIR"
+        DOCKER_CMD+=" alpine:latest"
+        DOCKER_CMD+=" /bin/sh -c \"$CMD\""
+        
+        eval "$DOCKER_CMD"
+        ;;
+        
+    *)
+        echo "Error: Unknown mode $MODE"
+        exit 1
+        ;;
+esac

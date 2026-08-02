@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec nix shell --impure --expr 'let pkgs = import <nixpkgs> {}; in pkgs.llama-cpp.override { vulkanSupport = true; }' -c llama-mtmd-cli "$@"

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${1:-all}"
+
+if [[ "$target" == "tokens" || "$target" == "all" ]]; then
+    if [[ -x /home/elwalid/.cache/.bun/bin/tokscale ]]; then
+      mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/waybar"
+      /home/elwalid/.cache/.bun/bin/tokscale models --opencode --today --json --no-spinner \
+        >"${XDG_CACHE_HOME:-$HOME/.cache}/waybar/tokens-today.json"
+    fi
+fi
+
+if [[ "$target" == "doctor" || "$target" == "all" ]]; then
+    "$HOME/.local/bin/desktop-doctor" --json >/dev/null
+fi
+
+if [[ "$target" != "tokens" && "$target" != "doctor" && "$target" != "all" ]]; then
+  echo "usage: waybar-cache-refresh [all|tokens|doctor]" >&2
+  exit 2
+fi

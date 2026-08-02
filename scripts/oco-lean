@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# oco-lean - OpenClaw through a minimal OpenCode config and pure plugin mode.
+
+set -euo pipefail
+
+LEAN_CONFIG_HOME="${OCO_LEAN_CONFIG_HOME:-$HOME/asayl-local-llm/configs/opencode-openclaw-lean}"
+export XDG_CONFIG_HOME="$LEAN_CONFIG_HOME"
+export OCO_FULL_CTX="${OCO_LEAN_CTX:-24576}"
+export OCO_LANE_LABEL="lean local Qwen3.5 Opus/OpenClaw"
+export OCO_STARTUP_NOTE="${OCO_STARTUP_NOTE:-6-18s, up to ~30s cold cache; lean OpenCode harness}"
+export OCO_COMMAND_NAME=oco-lean
+
+case "${1:-}" in
+  -h|--help|--status|--stop|ask)
+    exec "$HOME/.local/bin/oco" "$@"
+    ;;
+  run)
+    shift
+    exec "$HOME/.local/bin/oco" run --pure "$@"
+    ;;
+  *)
+    exec "$HOME/.local/bin/oco" --pure "$@"
+    ;;
+esac

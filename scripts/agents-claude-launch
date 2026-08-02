@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# agents-claude-launch — transparent wrapper for `claude` that makes the session
+# id DETERMINISTIC: it assigns --session-id at launch (so we always know exactly
+# which transcript this terminal owns) and registers a live record that
+# `agents-save` reads. Invoked via a `claude` zsh function; the real binary is
+# called by absolute path so there is no recursion.
+set -uo pipefail
+
+REAL="$HOME/.local/bin/claude"
+LIVE="$HOME/.local/state/agent-sessions/live"
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+mkdir -p "$LIVE"
+
+# Pass straight through (no id injection, no tracking) for non-interactive or
+# subcommand invocations — only real interactive sessions get tracked.
+for a in "$@"; do
+  case "$a" in
+    -p|--print|mcp|config|doctor|update|install|migrate-installer|--version|-v|--help|-h|setup-token)
+      exec "$REAL" "$@" ;;
+  esac
+done
+
+# Detect whether the user is already managing the session, and capture any
+# explicit id they passed.
+sid=""; manage=0; prev=""
+for a in "$@"; do
+  case "$a" in
+    -r|--resume|-c|--continue|--session-id|--fork-session) manage=1 ;;
+  esac
+  case "$prev" in
+    -r|--resume|--session-id) [[ "$a" =~ ^${UUID_RE}$ ]] && sid="$a" ;;
+  esac
+  prev="$a"
+done
+
+args=("$@")
+if [ "$manage" -eq 0 ]; then
+  sid="$(uuidgen)"
+  args=(--session-id "$sid" "$@")
+fi
+
+# Record uses $$ which, after exec below, becomes claude's own PID (exec
+# preserves the PID). So record.pid == the live claude process; agents-save
+# prunes any record whose pid is no longer alive.
+rec="$LIVE/claude-$$.json"
+jq -nc \
+  --arg d "$PWD" \
+  --arg s "$sid" \
+  --argjson p "$$" \
+  --arg t "$(tty 2>/dev/null | sed 's#/dev/##')" \
+  --argjson st "$(date +%s)" \
+  '{agent:"claude",dir:$d,session:$s,pid:$p,tty:$t,started:$st}' >"$rec" 2>/dev/null
+
+exec "$REAL" "${args[@]}"

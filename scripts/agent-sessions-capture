@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# agent-sessions-capture — snapshot every interactive coding-agent terminal
+# (claude / codex / opencode) into a resumable manifest.
+#
+# v2: precise claude session ids via a persistent pid->session map.
+#  - A pid already mapped keeps its session id (no drift while it lives).
+#  - A NEW claude pid is identified at first sight:
+#      1. `--resume <uuid>` in its cmdline (restorer-spawned sessions) -> exact
+#      2. a session file in its project store touched SINCE the process
+#         started, excluding ids claimed by other live pids -> matched
+#  - Never map a process to a session file older than the process itself;
+#    if identification fails, fall back to a dir-level `--continue` entry.
+#    (v1 ranked by raw mtime, which resurrected recently-closed sessions.)
+#  - codex: exact id via its open rollout fd. opencode: dir granularity.
+#  - Skips entirely while the user session is stopping, so shutdown teardown
+#    can never wipe the manifest half-dead. Last non-empty manifest is kept
+#    as manifest.lastgood.json.
+set -uo pipefail
+
+CLAUDE_STORE="$HOME/.claude/projects"
+CFG="$HOME/.config/agent-sessions"
+STATE="$HOME/.local/state/agent-sessions"
+MANIFEST="$CFG/manifest.json"
+PIDMAP="$STATE/pidmap.json"
+mkdir -p "$CFG" "$STATE"
+
+log() { printf '%s capture: %s\n' "$(date +%FT%T)" "$*" >>"$STATE/capture.log"; }
+
+# --- teardown guard ----------------------------------------------------------
+sysstate="$(systemctl --user is-system-running 2>/dev/null || true)"
+if [ "$sysstate" = "stopping" ]; then
+  log "user session stopping; skipping capture (manifest preserved)"
+  exit 0
+fi
+
+# --- boot gate ---------------------------------------------------------------
+boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 99999)"
+if [ ! -e "$STATE/restored-$boot" ] && [ "${uptime_s:-99999}" -lt 300 ]; then
+  log "awaiting restore (uptime ${uptime_s}s); preserving manifest"
+  exit 0
+fi
+
+is_pts()    { case "$1" in pts/*) return 0;; *) return 1;; esac; }
+valid_dir() { [ -n "${1:-}" ] && [ -d "$1" ] && case "$1" in /tmp/*|/run/*|/proc/*|/) return 1;; *) return 0;; esac; }
+pid_start() { date -d "$(ps -o lstart= -p "$1" 2>/dev/null)" +%s 2>/dev/null || echo 0; }
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+[ -f "$PIDMAP" ] || echo '{}' >"$PIDMAP"
+oldmap="$(cat "$PIDMAP" 2>/dev/null)"; [ -n "$oldmap" ] || oldmap='{}'
+
+tmp_entries="$(mktemp)"; tmp_map="$(mktemp)"
+trap 'rm -f "$tmp_entries" "$tmp_map"' EXIT
+echo '{}' >"$tmp_map"
+
+map_put() { # pid start agent dir session conf
+  local m; m="$(jq --arg p "$1" --arg st "$2" --arg a "$3" --arg d "$4" --arg s "$5" --arg c "$6" \
+    '.[$p]={start:($st|tonumber),agent:$a,dir:$d,session:$s,conf:$c}' "$tmp_map")"
+  printf '%s' "$m" >"$tmp_map"
+}
+old_get() { # pid start -> session (only if start matches: guards pid reuse)
+  jq -r --arg p "$1" --arg st "$2" \
+    'if (.[$p]? and (.[$p].start == ($st|tonumber))) then .[$p].session else "" end' <<<"$oldmap" 2>/dev/null
+}
+old_conf() { jq -r --arg p "$1" '.[$p].conf // "kept"' <<<"$oldmap" 2>/dev/null; }
+
+# ids already claimed this run (to exclude from window matching)
+claimed_has() { jq -e --arg s "$1" 'to_entries|any(.value.session == $s)' "$tmp_map" >/dev/null 2>&1; }
+
+# --- claude ------------------------------------------------------------------
+# process pids oldest-start first so earlier processes claim earlier files
+claude_pids="$(for pid in $(pgrep -x claude 2>/dev/null); do
+  is_pts "$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')" || continue
+  echo "$(pid_start "$pid") $pid"
+done | sort -n | awk '{print $2}')"
+
+for pid in $claude_pids; do
+  dir="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+  valid_dir "$dir" || continue
+  st="$(pid_start "$pid")"
+
+  # 1) already mapped (same pid + start) -> keep pinned
+  sid="$(old_get "$pid" "$st")"
+  if [ -n "$sid" ]; then
+    map_put "$pid" "$st" claude "$dir" "$sid" "$(old_conf "$pid")"
+    jq -nc --arg d "$dir" --arg s "$sid" '{agent:"claude",dir:$d,session:$s,resume:"id"}' >>"$tmp_entries"
+    continue
+  fi
+
+  # 2) exact: --resume <uuid> on its own command line
+  sid="$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null | grep -oE -- "--resume +${UUID_RE}" | grep -oE "$UUID_RE" | head -1)"
+  if [ -n "$sid" ]; then
+    map_put "$pid" "$st" claude "$dir" "$sid" exact
+    jq -nc --arg d "$dir" --arg s "$sid" '{agent:"claude",dir:$d,session:$s,resume:"id"}' >>"$tmp_entries"
+    continue
+  fi
+
+  # 3) window match: session file touched since this process started,
+  #    not claimed by another live pid. NEVER match files older than the pid.
+  slug="$(printf '%s' "$dir" | sed 's#/#-#g')"
+  store="$CLAUDE_STORE/$slug"
+  sid=""
+  if [ -d "$store" ]; then
+    while IFS= read -r cand; do
+      [ -n "$cand" ] || continue
+      claimed_has "$cand" && continue
+      sid="$cand"; break
+    done < <(find "$store" -maxdepth 1 -name '*.jsonl' -newermt "@$((st - 5))" -printf '%T@ %f\n' 2>/dev/null \
+             | sort -rn | sed 's/^[0-9.]* //; s/\.jsonl$//')
+  fi
+  if [ -n "$sid" ]; then
+    map_put "$pid" "$st" claude "$dir" "$sid" window
+    jq -nc --arg d "$dir" --arg s "$sid" '{agent:"claude",dir:$d,session:$s,resume:"id"}' >>"$tmp_entries"
+  else
+    # unidentified: dir-level continue, never a stale id
+    log "claude pid=$pid dir=$dir unidentified; recording dir-level continue"
+    jq -nc --arg d "$dir" '{agent:"claude",dir:$d,session:"last",resume:"continue"}' >>"$tmp_entries"
+  fi
+done
+
+# --- codex: exact session id from the open rollout fd ------------------------
+for pid in $(pgrep -x codex 2>/dev/null); do
+  is_pts "$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')" || continue
+  dir="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+  valid_dir "$dir" || continue
+  id=""
+  for fd in /proc/"$pid"/fd/*; do
+    tgt="$(readlink "$fd" 2>/dev/null)" || continue
+    case "$tgt" in
+      *rollout-*.jsonl) id="$(printf '%s' "$tgt" | grep -oE "$UUID_RE" | head -1)"; [ -n "$id" ] && break ;;
+    esac
+  done
+  if [ -n "$id" ]; then
+    jq -nc --arg d "$dir" --arg s "$id" '{agent:"codex",dir:$d,session:$s,resume:"id"}' >>"$tmp_entries"
+  else
+    jq -nc --arg d "$dir" '{agent:"codex",dir:$d,session:"last",resume:"last"}' >>"$tmp_entries"
+  fi
+done
+
+# --- opencode: interactive TUI only (has a pts; `serve` has none) -------------
+for pid in $(pgrep -x opencode 2>/dev/null); do
+  is_pts "$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')" || continue
+  dir="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+  valid_dir "$dir" || continue
+  jq -nc --arg d "$dir" '{agent:"opencode",dir:$d,session:"last",resume:"continue"}' >>"$tmp_entries"
+done
+
+# --- assemble & write atomically --------------------------------------------
+# dedup exact entries; collapse dir-level "continue" entries to one per
+# (agent,dir) so restore never opens the same latest-session twice
+sessions="$(jq -sc '
+  unique_by([.agent,.dir,.session])
+  | group_by([.agent,.dir])
+  | map( (map(select(.resume!="continue"))) + (map(select(.resume=="continue"))[0:1]) )
+  | flatten
+' "$tmp_entries" 2>/dev/null || echo '[]')"
+count="$(printf '%s' "$sessions" | jq 'length' 2>/dev/null || echo 0)"
+now="$(date +%s)"
+
+[ -f "$MANIFEST" ] && cp -f "$MANIFEST" "$STATE/manifest.prev.json" 2>/dev/null
+out="$(mktemp)"
+jq -n --argjson s "$sessions" --arg t "$now" \
+  '{version:2, captured_at:($t|tonumber), sessions:$s}' >"$out"
+mv -f "$out" "$MANIFEST"
+mv -f "$tmp_map" "$PIDMAP"; trap 'rm -f "$tmp_entries"' EXIT
+[ "$count" -ge 1 ] && cp -f "$MANIFEST" "$STATE/manifest.lastgood.json" 2>/dev/null
+log "captured $count session(s)"

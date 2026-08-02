@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# agents-save — freeze the coding-agent terminals you have open right now into
+# a manifest, so `agents-arise` can reopen them after reboot.
+#
+#  - claude: EXACT session id, read from live records written by the launcher
+#            (agents-claude-launch). No guessing.
+#  - codex:  EXACT session id, read from the open rollout fd.
+#  - opencode: directory-level (`--continue`).
+#  - claude terminals started WITHOUT the launcher (no live record) are saved
+#    directory-level with a warning, so you know to relaunch them for exact ids.
+set -uo pipefail
+
+CFG="$HOME/.config/agent-sessions"
+STATE="$HOME/.local/state/agent-sessions"
+LIVE="$STATE/live"
+MANIFEST="$CFG/manifest.json"
+mkdir -p "$CFG" "$LIVE"
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+is_pts()    { case "$1" in pts/*) return 0;; *) return 1;; esac; }
+valid_dir() { [ -n "${1:-}" ] && [ -d "$1" ] && case "$1" in /tmp/*|/run/*|/proc/*|/) return 1;; *) return 0;; esac; }
+
+tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+declare -A claude_covered   # dirs covered by an exact live record
+
+# 1) claude — exact ids from live registry, pruning dead records
+for rec in "$LIVE"/claude-*.json; do
+  [ -e "$rec" ] || continue
+  pid="$(jq -r '.pid // empty' "$rec" 2>/dev/null)"
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then rm -f "$rec"; continue; fi
+  dir="$(jq -r '.dir' "$rec" 2>/dev/null)"; valid_dir "$dir" || continue
+  sid="$(jq -r '.session // ""' "$rec" 2>/dev/null)"
+  claude_covered["$dir"]=1
+  if [[ "$sid" =~ ^${UUID_RE}$ ]]; then
+    jq -nc --arg d "$dir" --arg s "$sid" '{agent:"claude",dir:$d,session:$s,resume:"id"}' >>"$tmp"
+  else
+    jq -nc --arg d "$dir" '{agent:"claude",dir:$d,session:"",resume:"continue"}' >>"$tmp"
+  fi
+done
+
+# 1b) untracked claude terminals (opened before the launcher) — dir-level, warn
+untracked=0
+for pid in $(pgrep -x claude 2>/dev/null); do
+  is_pts "$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')" || continue
+  dir="$(readlink "/proc/$pid/cwd" 2>/dev/null)"; valid_dir "$dir" || continue
+  [ -n "${claude_covered[$dir]:-}" ] && continue
+  claude_covered["$dir"]=1
+  untracked=$((untracked+1))
+  jq -nc --arg d "$dir" '{agent:"claude",dir:$d,session:"",resume:"continue"}' >>"$tmp"
+done
+
+# 2) codex — exact id from open rollout fd
+for pid in $(pgrep -x codex 2>/dev/null); do
+  is_pts "$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')" || continue
+  dir="$(readlink "/proc/$pid/cwd" 2>/dev/null)"; valid_dir "$dir" || continue
+  id=""
+  for fd in /proc/"$pid"/fd/*; do
+    t="$(readlink "$fd" 2>/dev/null)" || continue
+    case "$t" in *rollout-*.jsonl) id="$(grep -oE "$UUID_RE" <<<"$t" | head -1)"; [ -n "$id" ] && break ;; esac
+  done
+  if [ -n "$id" ]; then
+    jq -nc --arg d "$dir" --arg s "$id" '{agent:"codex",dir:$d,session:$s,resume:"id"}' >>"$tmp"
+  else
+    jq -nc --arg d "$dir" '{agent:"codex",dir:$d,session:"",resume:"last"}' >>"$tmp"
+  fi
+done
+
+# 3) opencode — interactive TUI (has a pts), directory-level
+for pid in $(pgrep -x opencode 2>/dev/null); do
+  is_pts "$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')" || continue
+  dir="$(readlink "/proc/$pid/cwd" 2>/dev/null)"; valid_dir "$dir" || continue
+  jq -nc --arg d "$dir" '{agent:"opencode",dir:$d,session:"",resume:"continue"}' >>"$tmp"
+done
+
+sessions="$(jq -sc 'unique_by([.agent,.dir,.session])' "$tmp" 2>/dev/null || echo '[]')"
+count="$(jq 'length' <<<"$sessions")"
+jq -n --argjson s "$sessions" --argjson t "$(date +%s)" \
+  '{version:3, captured_at:$t, sessions:$s}' >"$MANIFEST"
+[ "$count" -ge 1 ] && cp -f "$MANIFEST" "$STATE/manifest.lastgood.json"
+
+echo "saved $count session(s) -> $MANIFEST"
+jq -r '.sessions[] | "  \(.agent)\t\(.resume)\t\(if (.session|length)>0 then .session[0:12] else "(latest)" end)\t\(.dir)"' "$MANIFEST" | column -t -s $'\t' 2>/dev/null || jq -c '.sessions[]' "$MANIFEST"
+[ "$untracked" -gt 0 ] && echo "" && echo "note: $untracked claude terminal(s) had no exact id (started before the launcher) — saved as (latest). Relaunch them with \`claude\` to get exact tracking."
+
+# keybind invocation (no terminal attached): notify instead of printing to void
+if [ ! -t 1 ] && command -v notify-send >/dev/null 2>&1; then
+  body="$(jq -r '.sessions | group_by(.agent)[] | "\(length) \(.[0].agent)"' "$MANIFEST" 2>/dev/null | paste -sd', ' -)"
+  notify-send -t 4000 "Agents saved: $count session(s)" "${body:-nothing open}"
+fi
+exit 0

@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+agent-health - Validate agent model configurations against OpenCode's model registry.
+
+Uses `opencode models` as the source of truth (not models.dev) since OpenCode
+may have additional models or aliases.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+
+DEFAULT_CONFIG_PATH = "/home/elwalid/.config/opencode/opencode.json"
+
+
+def eprint(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def load_config(path: str) -> dict:
+    if not os.path.exists(path):
+        eprint(f"Error: config not found at {path}")
+        sys.exit(2)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        eprint(f"Error: invalid JSON in {path}: {exc}")
+        sys.exit(2)
+    except OSError as exc:
+        eprint(f"Error: unable to read config at {path}: {exc}")
+        sys.exit(2)
+
+    agents = data.get("agents")
+    if isinstance(agents, dict):
+        return agents
+    # Newer OpenCode layouts may not use an `agents` object in this file.
+    return {}
+
+
+def fetch_opencode_models(timeout: float) -> tuple[set[str] | None, str | None]:
+    """Fetch valid models from `opencode models` command."""
+    opencode_bin = shutil.which("opencode")
+    if not opencode_bin:
+        return None, "opencode not found in PATH"
+    
+    try:
+        result = subprocess.run(
+            [opencode_bin, "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None, f"opencode models failed: {result.stderr[:100]}"
+        
+        # Parse output - one model ID per line
+        models = set()
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line and "/" in line:
+                models.add(line)
+        
+        return models, None
+    except subprocess.TimeoutExpired:
+        return None, "opencode models timed out"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def normalize_model(value: object) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None
+    return None
+
+
+def validate_model(model: str, valid_models: set[str] | None, error: str | None) -> str:
+    if error is not None:
+        return "VALIDATION_UNAVAILABLE"
+    if "/" not in model:
+        return "INVALID_FORMAT"
+    if valid_models is None:
+        return "VALIDATION_UNAVAILABLE"
+    if model in valid_models:
+        return "OK"
+    
+    # Check if it's a base model + variant pattern (e.g., openai/gpt-5.2-high)
+    # Try stripping common variant suffixes
+    for suffix in ["-high", "-xhigh", "-low", "-max", "-mini", "-thinking"]:
+        if model.endswith(suffix):
+            base = model[:-len(suffix)]
+            if base in valid_models:
+                return "OK (variant)"
+    
+    return "UNKNOWN_MODEL"
+
+
+def build_rows(agents: dict, valid_models: set[str] | None, error: str | None) -> list[dict]:
+    rows = []
+    for agent, config in agents.items():
+        model = normalize_model(config.get("model") if isinstance(config, dict) else None)
+        if model is None:
+            status = "MISSING_MODEL"
+        else:
+            status = validate_model(model, valid_models, error)
+        rows.append({"agent": str(agent), "model": model, "status": status})
+    return rows
+
+
+def summarize(rows: list[dict]) -> dict:
+    total = len(rows)
+    ok = sum(1 for row in rows if row["status"].startswith("OK"))
+    return {"total": total, "ok": ok, "fail": total - ok}
+
+
+def print_table(rows: list[dict], summary: dict) -> None:
+    agent_width = max([len("agent")] + [len(row["agent"]) for row in rows])
+    model_width = max([len("model")] + [len(row["model"] or "") for row in rows])
+    status_width = max([len("status")] + [len(row["status"]) for row in rows])
+    header = f"{'agent':<{agent_width}}  {'model':<{model_width}}  {'status':<{status_width}}"
+    print(header)
+    print(f"{'-' * agent_width}  {'-' * model_width}  {'-' * status_width}")
+    for row in rows:
+        model_value = row["model"] or ""
+        print(
+            f"{row['agent']:<{agent_width}}  "
+            f"{model_value:<{model_width}}  "
+            f"{row['status']:<{status_width}}"
+        )
+    print(
+        f"Summary: total={summary['total']} ok={summary['ok']} fail={summary['fail']}"
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Validate agent models health")
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Config path (default: {DEFAULT_CONFIG_PATH})",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Timeout in seconds for opencode models (default: 10)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON output",
+    )
+    args = parser.parse_args()
+
+    agents = load_config(args.config)
+    valid_models, error = fetch_opencode_models(args.timeout)
+
+    rows = build_rows(agents, valid_models, error)
+    summary = summarize(rows)
+
+    if args.json:
+        payload = {"agents": rows, "summary": summary}
+        print(json.dumps(payload, indent=2))
+    else:
+        print_table(rows, summary)
+
+    return 0 if summary["fail"] == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

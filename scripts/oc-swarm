@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  oc-swarm <path/to/task.yaml> [-n <attempts>] [--concurrency <n>]
+
+Runs best-of-N attempts (default N=4) and picks a winner among attempts
+that pass gates.
+
+Defaults:
+  attempts: 4
+  concurrency: $OC_SWARM_CONCURRENCY (or 2)
+
+Artifacts:
+  docs/walid_runs/<task>/<run-id>/attempt-XX/
+  docs/walid_runs/<task>/<run-id>/winner.txt
+EOF
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+task_path=${1:-}
+if [[ -z "$task_path" ]]; then
+  usage >&2
+  exit 2
+fi
+shift || true
+
+attempts=4
+concurrency=${OC_SWARM_CONCURRENCY:-2}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--attempts)
+      attempts="${2:-}"
+      shift 2
+      ;;
+    --concurrency)
+      concurrency="${2:-}"
+      shift 2
+      ;;
+    *)
+      echo "oc-swarm: unknown arg: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "oc-swarm: must run inside a git repo" >&2
+  exit 2
+fi
+root=$(git rev-parse --show-toplevel)
+
+task_abs="$task_path"
+if [[ "$task_abs" != /* ]]; then
+  task_abs="$PWD/$task_abs"
+fi
+if [[ ! -f "$task_abs" ]]; then
+  echo "oc-swarm: task file not found: $task_abs" >&2
+  exit 2
+fi
+
+task_dir=$(dirname "$task_abs")
+
+task_name=$(jq -r '.name // empty' "$task_abs" 2>/dev/null || true)
+if [[ -z "$task_name" || "$task_name" == "null" ]]; then
+  task_name=$(basename "$task_dir")
+fi
+
+run_id=$(date +%Y%m%d-%H%M%S)
+run_root="$root/docs/walid_runs/$task_name/$run_id"
+mkdir -p "$run_root"
+
+echo "run: $run_root"
+echo "attempts: $attempts, concurrency: $concurrency"
+
+active_jobs=0
+pids=()
+
+start_attempt() {
+  local i=$1
+  (/home/elwalid/bin/oc-run "$task_abs" --run-id "$run_id" --attempt "$i") &
+  pids+=("$!")
+}
+
+for i in $(seq 1 "$attempts"); do
+  if [[ $active_jobs -ge $concurrency ]]; then
+    wait -n || true
+    active_jobs=$((active_jobs - 1))
+  fi
+  start_attempt "$i"
+  active_jobs=$((active_jobs + 1))
+done
+
+failures=0
+for pid in "${pids[@]}"; do
+  if ! wait "$pid"; then
+    failures=$((failures + 1))
+  fi
+done
+
+winner=""
+winner_lines=""
+
+for r in "$run_root"/attempt-*/result.json; do
+  [[ -f "$r" ]] || continue
+  gates_pass=$(jq -r '.gates_pass' "$r" 2>/dev/null || echo "false")
+  [[ "$gates_pass" == "true" ]] || continue
+
+  attempt_dir=$(dirname "$r")
+  lines=$(wc -l <"$attempt_dir/patch.diff" 2>/dev/null || echo "999999")
+  if [[ -z "$winner" || "$lines" -lt "$winner_lines" ]]; then
+    winner="$attempt_dir"
+    winner_lines="$lines"
+  fi
+done
+
+winner_file="$run_root/winner.txt"
+if [[ -n "$winner" ]]; then
+  printf '%s\n' "$winner" >"$winner_file"
+  echo "winner: $winner"
+else
+  printf '%s\n' "" >"$winner_file"
+  echo "winner: none (no passing attempts)" >&2
+  exit 1
+fi

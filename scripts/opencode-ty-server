@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$PWD"
+project_dir=""
+
+if [[ -f "$root/pyproject.toml" || -f "$root/uv.lock" ]]; then
+  project_dir="$root"
+else
+  for candidate in "$root"/*; do
+    [[ -d "$candidate" ]] || continue
+    if [[ -f "$candidate/pyproject.toml" || -f "$candidate/uv.lock" ]]; then
+      if [[ -n "$project_dir" ]]; then
+        project_dir=""
+        break
+      fi
+      project_dir="$candidate"
+    fi
+  done
+fi
+
+if [[ -n "$project_dir" && -f "$project_dir/uv.lock" ]] && command -v uv >/dev/null 2>&1; then
+  exec uv run --directory "$project_dir" ty server
+fi
+
+exec ty server

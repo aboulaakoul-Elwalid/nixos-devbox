@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+QUIET=0
+FORCE=0
+NOTIFY=1
+
+for arg in "$@"; do
+  case "$arg" in
+    --quiet)
+      QUIET=1
+      ;;
+    --force)
+      FORCE=1
+      ;;
+    --no-notify)
+      NOTIFY=0
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: oc-update-check [--quiet] [--force] [--no-notify]
+
+Checks latest OpenCode CLI and desktop versions, updates the local cache,
+and optionally sends a desktop notification when updates are available.
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/opencode"
+STATUS_FILE="$STATE_DIR/update-status.json"
+LAST_CHECK_FILE="$STATE_DIR/last-update-check"
+INTERVAL_SECONDS="${OPENCODE_UPDATE_CHECK_INTERVAL:-86400}"
+PYTHON_BIN="${PYTHON_BIN:-/run/current-system/sw/bin/python3}"
+NPM_BIN="${NPM_BIN:-/run/current-system/sw/bin/npm}"
+NOTIFY_BIN="${NOTIFY_BIN:-/run/current-system/sw/bin/notify-send}"
+
+mkdir -p "$STATE_DIR"
+
+print_status() {
+  [[ -f "$STATUS_FILE" ]] || return 0
+  "$PYTHON_BIN" - "$STATUS_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+cli = data["cli"]
+desktop = data["desktop"]
+lines = [
+    f"CLI: {cli['current']} -> {cli['latest']}" + (" (update available)" if cli["update_available"] else " (current)"),
+    f"Desktop: {desktop['current']} -> {desktop['latest']}" + (" (update available)" if desktop["update_available"] else " (current)"),
+]
+print("\n".join(lines))
+PY
+}
+
+should_skip() {
+  [[ "$FORCE" -eq 1 ]] && return 1
+  [[ ! -f "$LAST_CHECK_FILE" ]] && return 1
+
+  local last_check now age
+  last_check="$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  age=$(( now - last_check ))
+  (( age < INTERVAL_SECONDS ))
+}
+
+if should_skip; then
+  if [[ "$QUIET" -eq 0 ]]; then
+    print_status
+  fi
+  exit 0
+fi
+
+REMOTE_JSON="$("$PYTHON_BIN" - "$NPM_BIN" "$STATUS_FILE" <<'PY'
+import json
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+
+npm_bin = sys.argv[1]
+status_file = sys.argv[2]
+api = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
+
+cached = {}
+try:
+    with open(status_file, "r", encoding="utf-8") as fh:
+        cached = json.load(fh)
+except FileNotFoundError:
+    cached = {}
+except json.JSONDecodeError:
+    cached = {}
+
+release = {}
+try:
+    with urllib.request.urlopen(api, timeout=15) as response:
+        release = json.load(response)
+except (urllib.error.URLError, TimeoutError):
+    release = {}
+
+tag = str(release.get("tag_name", "")).lstrip("v") or cached.get("desktop", {}).get("latest", "")
+app = None
+for asset in release.get("assets", []):
+    if asset.get("name") == "opencode-electron-linux-x86_64.AppImage":
+        app = asset
+        break
+
+try:
+    cli = subprocess.run(
+        [npm_bin, "view", "opencode-ai", "version", "--silent"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    cli_stdout = cli.stdout.strip()
+    if not cli_stdout or cli.returncode != 0:
+        cli_stdout = cached.get("cli", {}).get("latest", "")
+except subprocess.TimeoutExpired:
+    cli_stdout = cached.get("cli", {}).get("latest", "")
+
+payload = {
+    "latest_cli_version": cli_stdout,
+    "latest_desktop_version": tag,
+    "latest_desktop_url": app.get("browser_download_url", "") if app else cached.get("desktop", {}).get("download_url", ""),
+    "latest_desktop_sha256": str(app.get("digest", "")).removeprefix("sha256:") if app else cached.get("desktop", {}).get("sha256", ""),
+}
+print(json.dumps(payload))
+PY
+)"
+
+LOCAL_JSON="$("$PYTHON_BIN" - <<'PY'
+import glob
+import json
+import os
+import re
+import subprocess
+
+home = os.path.expanduser("~")
+cli_candidates = [
+    os.path.join(home, ".npm-global/bin/opencode"),
+    os.path.join(home, ".local/bin/opencode"),
+]
+
+cli_version = "unknown"
+for candidate in cli_candidates:
+    if os.path.exists(candidate):
+        proc = subprocess.run([candidate, "--version"], capture_output=True, text=True, check=False)
+        out = (proc.stdout or proc.stderr).strip()
+        if out:
+            cli_version = out.splitlines()[-1].strip()
+            break
+
+current_link = os.path.join(home, "Applications", "opencode-electron-current.AppImage")
+if os.path.exists(current_link):
+    current_path = os.path.realpath(current_link)
+else:
+    matches = sorted(glob.glob(os.path.join(home, "Applications", "opencode-electron-*.AppImage")))
+    current_path = matches[-1] if matches else ""
+
+match = re.search(r"(\d+\.\d+\.\d+)", os.path.basename(current_path))
+desktop_version = match.group(1) if match else "missing"
+
+print(json.dumps({
+    "current_cli_version": cli_version,
+    "current_desktop_version": desktop_version,
+    "current_desktop_path": current_path,
+}))
+PY
+)"
+
+"$PYTHON_BIN" - "$STATUS_FILE" "$REMOTE_JSON" "$LOCAL_JSON" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+status_path, remote_json, local_json = sys.argv[1:4]
+remote = json.loads(remote_json)
+local = json.loads(local_json)
+
+status = {
+    "checked_at": datetime.now(timezone.utc).isoformat(),
+    "cli": {
+        "current": local["current_cli_version"],
+        "latest": remote["latest_cli_version"] or local["current_cli_version"],
+        "update_available": bool(remote["latest_cli_version"]) and remote["latest_cli_version"] != local["current_cli_version"],
+    },
+    "desktop": {
+        "current": local["current_desktop_version"],
+        "latest": remote["latest_desktop_version"] or local["current_desktop_version"],
+        "update_available": bool(remote["latest_desktop_version"]) and remote["latest_desktop_version"] != local["current_desktop_version"],
+        "current_path": local["current_desktop_path"],
+        "download_url": remote["latest_desktop_url"],
+        "sha256": remote["latest_desktop_sha256"],
+    },
+}
+
+with open(status_path, "w", encoding="utf-8") as fh:
+    json.dump(status, fh, indent=2)
+    fh.write("\n")
+PY
+
+date +%s > "$LAST_CHECK_FILE"
+
+if [[ "$NOTIFY" -eq 1 ]] && [[ -x "$NOTIFY_BIN" ]]; then
+  "$PYTHON_BIN" - "$STATUS_FILE" "$NOTIFY_BIN" <<'PY'
+import json
+import subprocess
+import sys
+
+status_path, notify_bin = sys.argv[1:3]
+with open(status_path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+parts = []
+if data["cli"]["update_available"]:
+    parts.append(f"CLI {data['cli']['current']} -> {data['cli']['latest']}")
+if data["desktop"]["update_available"]:
+    parts.append(f"Desktop {data['desktop']['current']} -> {data['desktop']['latest']}")
+
+if parts:
+    subprocess.run(
+        [notify_bin, "-a", "OpenCode", "OpenCode update available", "\n".join(parts)],
+        check=False,
+    )
+PY
+fi
+
+if [[ "$QUIET" -eq 0 ]]; then
+  print_status
+fi

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# agents-arise — reopen the agent terminals saved by `agents-save`, resuming
+# each exact session. Run it after a reboot (or bind it to a key).
+#
+#   agents-arise            reopen everything in the manifest
+#   agents-arise --dry-run  show what it would open, spawn nothing
+set -uo pipefail
+
+CFG="$HOME/.config/agent-sessions"
+MANIFEST="$CFG/manifest.json"
+
+CLAUDE="$HOME/.local/bin/claude"
+CODEX="$HOME/.npm-global/bin/codex"
+OPENCODE="$HOME/.npm-global/bin/opencode"
+SHELL_BIN="/run/current-system/sw/bin/zsh"
+TERMINAL="${AGENT_SESSIONS_TERMINAL:-/run/current-system/sw/bin/kitty}"
+STAGGER="${AGENTS_ARISE_STAGGER:-0.4}"
+
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
+[ -f "$MANIFEST" ] || { echo "no manifest at $MANIFEST — run agents-save first"; exit 1; }
+
+launch() { # dir title cmd
+  local dir="$1" title="$2" cmd="$3"
+  local inner="cd $(printf '%q' "$dir") 2>/dev/null; $cmd; ec=\$?; echo; echo \"[agents] '$cmd' exited (\$ec) — shell kept open\"; exec ${SHELL_BIN} -i"
+  if [ "$DRY" -eq 1 ]; then
+    printf '  %-28s %s\n      -> %s\n' "$title" "$dir" "$cmd"
+    return
+  fi
+  setsid -f "$TERMINAL" \
+    --class=agent-session \
+    --title="$title" \
+    --directory="$dir" \
+    "$SHELL_BIN" -lc "$inner" >/dev/null 2>&1
+}
+
+n=0
+while IFS=$'\t' read -r agent dir session resume; do
+  [ -n "${agent:-}" ] || continue
+  case "$agent" in
+    claude)   if [ "$resume" = id ]; then cmd="$CLAUDE --resume $session"; else cmd="$CLAUDE --continue"; fi ;;
+    codex)    if [ "$resume" = id ]; then cmd="$CODEX resume $session"; else cmd="$CODEX resume --last"; fi ;;
+    opencode) cmd="$OPENCODE --continue" ;;
+    *) continue ;;
+  esac
+  launch "$dir" "agent:$agent:$(basename "$dir")" "$cmd"
+  n=$((n+1))
+  [ "$DRY" -eq 0 ] && sleep "$STAGGER"
+done < <(jq -r '.sessions[] | [.agent, .dir, (.session // ""), (.resume // "continue")] | @tsv' "$MANIFEST")
+
+echo "$([ "$DRY" -eq 1 ] && echo 'would launch' || echo 'launched') $n session(s)"
+
+# keybind invocation (no terminal attached): notify
+if [ "$DRY" -eq 0 ] && [ ! -t 1 ] && command -v notify-send >/dev/null 2>&1; then
+  notify-send -t 4000 "Agents arising" "reopening $n session(s)…"
+fi

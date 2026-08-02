@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# agent-sessions — control surface for the coding-agent session restorer.
+set -uo pipefail
+CFG="$HOME/.config/agent-sessions"
+STATE="$HOME/.local/state/agent-sessions"
+MANIFEST="$CFG/manifest.json"
+
+usage() {
+  cat <<'EOF'
+agent-sessions — reopen your claude/codex/opencode terminals after reboot
+
+  agent-sessions status        show manifest summary + timer state
+  agent-sessions list          pretty-print the captured sessions
+  agent-sessions capture       snapshot open sessions now (force)
+  agent-sessions dry-run       show what restore would spawn (no windows)
+  agent-sessions restore       restore now (spawns terminals; --force to repeat)
+  agent-sessions edit          open the manifest in $EDITOR
+  agent-sessions rollback      restore manifest from last non-empty snapshot
+  agent-sessions logs          tail capture + restore logs
+  agent-sessions enable        enable the 30s capture timer
+  agent-sessions disable       disable the capture timer
+EOF
+}
+
+case "${1:-status}" in
+  status)
+    echo "manifest: $MANIFEST"
+    if [ -f "$MANIFEST" ]; then
+      ts=$(jq -r '.captured_at' "$MANIFEST" 2>/dev/null)
+      echo "captured: $(date -d "@$ts" 2>/dev/null || echo "$ts")  ($(jq '.sessions|length' "$MANIFEST" 2>/dev/null) session(s))"
+      jq -r '.sessions | group_by(.agent)[] | "  \(.[0].agent): \(length)"' "$MANIFEST" 2>/dev/null
+    else
+      echo "captured: (none yet)"
+    fi
+    echo "timer:    $(systemctl --user is-active agent-sessions-capture.timer 2>/dev/null) / $(systemctl --user is-enabled agent-sessions-capture.timer 2>/dev/null)"
+    if [ -f "$STATE/pidmap.json" ]; then
+      echo "pid map:  $(jq 'length' "$STATE/pidmap.json" 2>/dev/null) tracked, confidence: $(jq -r '[.[].conf]|group_by(.)|map("\(.[0])=\(length)")|join(" ")' "$STATE/pidmap.json" 2>/dev/null)"
+    fi
+    ;;
+  list)
+    [ -f "$MANIFEST" ] || { echo "no manifest yet"; exit 0; }
+    jq -r '.sessions[] | "\(.agent)\t\(.resume)\t\(.session[0:12])\t\(.dir)"' "$MANIFEST" \
+      | column -t -s $'\t' 2>/dev/null || cat "$MANIFEST"
+    ;;
+  capture)     exec "$HOME/.local/bin/agent-sessions-capture" ;;
+  dry-run)     exec "$HOME/.local/bin/agent-sessions-restore" --dry-run ;;
+  restore)     shift; exec "$HOME/.local/bin/agent-sessions-restore" "$@" ;;
+  edit)        exec "${EDITOR:-nano}" "$MANIFEST" ;;
+  rollback)
+    if [ -f "$STATE/manifest.lastgood.json" ]; then
+      cp -f "$STATE/manifest.lastgood.json" "$MANIFEST"
+      echo "manifest restored from last non-empty snapshot:"
+      jq -r '.sessions[] | "  \(.agent)\t\(.dir)"' "$MANIFEST"
+    else
+      echo "no lastgood snapshot yet"; exit 1
+    fi
+    ;;
+  logs)        tail -n 40 -F "$STATE/capture.log" "$STATE/restore.log" 2>/dev/null ;;
+  enable)
+    systemctl --user enable --now agent-sessions-capture.timer
+    echo "enabled: 30s capture timer"
+    ;;
+  disable)
+    systemctl --user disable --now agent-sessions-capture.timer
+    echo "disabled"
+    ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

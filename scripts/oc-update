@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+UPDATE_CLI=1
+UPDATE_DESKTOP=1
+CHECK_ONLY=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --cli-only)
+      UPDATE_DESKTOP=0
+      ;;
+    --desktop-only)
+      UPDATE_CLI=0
+      ;;
+    --check-only)
+      CHECK_ONLY=1
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: oc-update [--cli-only] [--desktop-only] [--check-only]
+
+Stages OpenCode updates safely:
+- CLI via npm global install with version verification
+- Desktop via versioned AppImage + stable current symlink
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/opencode"
+STATUS_FILE="$STATE_DIR/update-status.json"
+PYTHON_BIN="${PYTHON_BIN:-/run/current-system/sw/bin/python3}"
+NPM_BIN="${NPM_BIN:-/run/current-system/sw/bin/npm}"
+SHA256_BIN="${SHA256_BIN:-/run/current-system/sw/bin/sha256sum}"
+
+mkdir -p "$STATE_DIR" "$HOME/Applications"
+
+/run/current-system/sw/bin/bash "$HOME/.local/bin/oc-update-check" --force --no-notify >/dev/null
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  /run/current-system/sw/bin/bash "$HOME/.local/bin/oc-update-check"
+  exit 0
+fi
+
+read_status() {
+  local field="$1"
+  "$PYTHON_BIN" - "$STATUS_FILE" "$field" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1:3]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+current = data
+for part in field.split("."):
+    current = current[part]
+
+if isinstance(current, bool):
+    print("true" if current else "false")
+else:
+    print(current)
+PY
+}
+
+if [[ "$UPDATE_CLI" -eq 1 ]]; then
+  cli_current="$(read_status cli.current)"
+  cli_latest="$(read_status cli.latest)"
+  cli_update_available="$(read_status cli.update_available)"
+
+  if [[ "$cli_update_available" == "true" ]]; then
+    "$NPM_BIN" install -g "opencode-ai@$cli_latest"
+    cli_after="$("$HOME/.npm-global/bin/opencode" --version 2>/dev/null || true)"
+    if [[ "$cli_after" != "$cli_latest" ]]; then
+      "$NPM_BIN" install -g "opencode-ai@$cli_current" >/dev/null 2>&1 || true
+      echo "CLI update failed verification; attempted rollback to $cli_current." >&2
+      exit 1
+    fi
+    echo "CLI updated: $cli_current -> $cli_after"
+  else
+    echo "CLI already current: $cli_current"
+  fi
+fi
+
+if [[ "$UPDATE_DESKTOP" -eq 1 ]]; then
+  desktop_current="$(read_status desktop.current)"
+  desktop_latest="$(read_status desktop.latest)"
+  desktop_update_available="$(read_status desktop.update_available)"
+  desktop_url="$(read_status desktop.download_url)"
+  desktop_sha256="$(read_status desktop.sha256)"
+
+  if [[ "$desktop_update_available" == "true" ]]; then
+    target="$HOME/Applications/opencode-electron-$desktop_latest.AppImage"
+    temp_target="$target.download"
+    current_link="$HOME/Applications/opencode-electron-current.AppImage"
+
+    if [[ ! -f "$target" ]]; then
+      curl -fL "$desktop_url" -o "$temp_target"
+      if [[ -n "$desktop_sha256" ]]; then
+        printf '%s  %s\n' "$desktop_sha256" "$temp_target" | "$SHA256_BIN" -c -
+      fi
+      chmod 755 "$temp_target"
+      mv "$temp_target" "$target"
+    fi
+
+    ln -sfn "$target" "$current_link"
+    echo "Desktop updated: $desktop_current -> $desktop_latest"
+  else
+    echo "Desktop already current: $desktop_current"
+  fi
+fi
+
+/run/current-system/sw/bin/bash "$HOME/.local/bin/oc-update-check" --force --no-notify >/dev/null
+printf '[%s] refreshed OpenCode via oc-update\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$HOME/MIGRATION_LOG.txt"

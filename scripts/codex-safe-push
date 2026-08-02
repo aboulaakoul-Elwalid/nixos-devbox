@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# > 1 )); then
+  echo "usage: codex-safe-push [remote]" >&2
+  exit 2
+fi
+
+remote="${1:-origin}"
+if [[ -z "$remote" || "$remote" == -* ]]; then
+  echo "codex-safe-push: invalid remote name" >&2
+  exit 2
+fi
+
+git rev-parse --is-inside-work-tree >/dev/null
+branch="$(git branch --show-current)"
+if [[ -z "$branch" ]]; then
+  echo "codex-safe-push: detached HEAD is not publishable" >&2
+  exit 2
+fi
+if [[ "$branch" == "main" || "$branch" == "master" ]]; then
+  echo "codex-safe-push: refusing to push protected branch $branch" >&2
+  exit 2
+fi
+
+git remote get-url "$remote" >/dev/null
+exec git push --set-upstream "$remote" "HEAD:refs/heads/$branch"

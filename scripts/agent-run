@@ -1,0 +1,2112 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+VERSION = 2
+TASK_SCHEMA_VERSION = 1
+LANE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+STATUS_ORDER = ["planned", "running", "done", "failed", "integrated", "abandoned"]
+DEFAULT_STALL_SECONDS = 120.0
+
+
+class AgentRunError(RuntimeError):
+    pass
+
+
+def now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def elapsed_seconds(value: str | None) -> float | None:
+    started = parse_time(value)
+    if started is None:
+        return None
+    return max(0.0, (datetime.now().astimezone() - started).total_seconds())
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "<unknown>"
+    seconds = max(0, int(seconds))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{sec:02d}s"
+    if minutes:
+        return f"{minutes}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def slugify(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9._-]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value or "run"
+
+
+def run_cmd(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    capture: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+    if check and proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        detail = stderr or stdout or f"exit {proc.returncode}"
+        raise AgentRunError(f"{' '.join(cmd)} failed: {detail}")
+    return proc
+
+
+def git(root: Path, args: list[str], *, check: bool = True) -> str:
+    proc = run_cmd(["git", "-C", str(root), *args], check=check)
+    return (proc.stdout or "").strip()
+
+
+def repo_root() -> Path:
+    proc = run_cmd(["git", "rev-parse", "--show-toplevel"], check=False)
+    if proc.returncode != 0:
+        raise AgentRunError("agent-run must be run inside a git repository")
+    return Path((proc.stdout or "").strip()).resolve()
+
+
+def ensure_clean(root: Path, *, allow_dirty: bool) -> None:
+    status = git(root, ["status", "--porcelain", "--untracked-files=no"], check=True)
+    if status and not allow_dirty:
+        raise AgentRunError(
+            "main checkout has tracked changes; commit/stash/postpone first, or rerun with --allow-dirty\n"
+            + status
+        )
+
+
+def tracked_status(root: Path) -> str:
+    return git(root, ["status", "--porcelain", "--untracked-files=no"], check=True)
+
+
+def runs_root(root: Path) -> Path:
+    return root / ".codex" / "runs"
+
+
+def current_run_file(root: Path) -> Path:
+    return runs_root(root) / "current"
+
+
+def run_root(root: Path, run_id: str) -> Path:
+    return runs_root(root) / run_id
+
+
+def manifest_path(root: Path, run_id: str) -> Path:
+    return run_root(root, run_id) / "manifest.json"
+
+
+def read_current_run(root: Path) -> str | None:
+    path = current_run_file(root)
+    if path.exists():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    return None
+
+
+def resolve_run_id(root: Path, requested: str | None) -> str:
+    if requested:
+        return requested
+    current = read_current_run(root)
+    if current:
+        return current
+    candidates = [
+        p.name
+        for p in runs_root(root).glob("*")
+        if p.is_dir() and (p / "manifest.json").exists()
+    ]
+    if not candidates:
+        raise AgentRunError("no agent-run manifest found; start with: agent-run init <name>")
+    candidates.sort(key=lambda rid: manifest_path(root, rid).stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def load_manifest(root: Path, requested: str | None) -> tuple[str, dict[str, Any]]:
+    run_id = resolve_run_id(root, requested)
+    path = manifest_path(root, run_id)
+    if not path.exists():
+        raise AgentRunError(f"manifest not found: {path}")
+    return run_id, json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_manifest(root: Path, manifest: dict[str, Any]) -> None:
+    manifest["updated_at"] = now()
+    path = manifest_path(root, manifest["run_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def require_lane_name(name: str) -> None:
+    if not LANE_RE.match(name):
+        raise AgentRunError(
+            f"invalid lane name {name!r}; use only letters, digits, dot, underscore, and dash"
+        )
+
+
+def rel_to_repo(root: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def abs_from_repo(root: Path, value: str) -> Path:
+    p = Path(value)
+    return p if p.is_absolute() else root / p
+
+
+def lane_by_name(manifest: dict[str, Any], lane_name: str) -> dict[str, Any]:
+    for lane in manifest.get("lanes", []):
+        if lane["name"] == lane_name:
+            return lane
+    raise AgentRunError(f"lane not found: {lane_name}")
+
+
+def selected_lanes(manifest: dict[str, Any], names: list[str] | None) -> list[dict[str, Any]]:
+    lanes = manifest.get("lanes", [])
+    if names:
+        return [lane_by_name(manifest, name) for name in names]
+    return lanes
+
+
+def branch_exists(root: Path, branch: str) -> bool:
+    proc = run_cmd(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", branch], check=False)
+    return proc.returncode == 0
+
+
+def worktree_registered(root: Path, path: Path) -> bool:
+    out = git(root, ["worktree", "list", "--porcelain"], check=True)
+    needle = f"worktree {path.resolve()}"
+    return any(line.strip() == needle for line in out.splitlines())
+
+
+def path_overlap(a: str, b: str) -> bool:
+    if any(ch in a + b for ch in "*?[]"):
+        return False
+    pa = Path(a).as_posix().strip("/")
+    pb = Path(b).as_posix().strip("/")
+    if not pa or not pb:
+        return True
+    return pa == pb or pa.startswith(pb + "/") or pb.startswith(pa + "/")
+
+
+def ensure_run_dirs(root: Path, run_id: str) -> None:
+    base = run_root(root, run_id)
+    for name in [
+        "prompts",
+        "reports",
+        "specs",
+        "logs",
+        "bin",
+        "verification",
+        "inbox",
+        "integration",
+    ]:
+        (base / name).mkdir(parents=True, exist_ok=True)
+
+
+def prompt_only_root(root: Path) -> Path:
+    return root / ".codex" / "prompts" / "agent-run"
+
+
+def tasks_root(root: Path) -> Path:
+    return root / ".codex" / "tasks"
+
+
+def current_task_file(root: Path) -> Path:
+    return tasks_root(root) / "current"
+
+
+def task_root(root: Path, task_id: str) -> Path:
+    return tasks_root(root) / task_id
+
+
+def task_state_path(root: Path, task_id: str) -> Path:
+    return task_root(root, task_id) / "task.json"
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+def executable_version(executable: str) -> dict[str, str | None]:
+    resolved = shutil.which(executable)
+    if not resolved:
+        return {"path": None, "version": None}
+    proc = run_cmd([resolved, "--version"], check=False)
+    version = (proc.stdout or proc.stderr or "").strip() or None
+    return {"path": resolved, "version": version}
+
+
+def config_fingerprints(root: Path) -> dict[str, str]:
+    candidates = [
+        Path.home() / ".codex" / "AGENTS.md",
+        Path.home() / ".config" / "opencode" / "AGENTS.md",
+        root / "AGENTS.md",
+        root / "pnpm-lock.yaml",
+        root / "package-lock.json",
+        root / "bun.lock",
+        root / "bun.lockb",
+        root / "Cargo.lock",
+        root / "uv.lock",
+    ]
+    result: dict[str, str] = {}
+    for path in candidates:
+        if path.is_file():
+            result[str(path)] = sha256_file(path)
+    return result
+
+
+def save_task(root: Path, task: dict[str, Any]) -> None:
+    task["updated_at"] = now()
+    path = task_state_path(root, task["task_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(task, indent=2, sort_keys=True) + "\n"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    os.replace(temporary, path)
+    for stale in path.parent.glob(f".{path.name}.*.tmp"):
+        try:
+            if time.time() - stale.stat().st_mtime > 3600:
+                stale.unlink()
+        except OSError:
+            pass
+
+
+def read_current_task(root: Path) -> str | None:
+    path = current_task_file(root)
+    if not path.exists():
+        return None
+    value = path.read_text(encoding="utf-8").strip()
+    return value or None
+
+
+def resolve_task_id(root: Path, requested: str | None) -> str:
+    if requested:
+        return requested
+    current = read_current_task(root)
+    if current and task_state_path(root, current).exists():
+        return current
+    candidates = [
+        path.parent.name
+        for path in tasks_root(root).glob("*/task.json")
+        if path.is_file()
+    ]
+    if not candidates:
+        raise AgentRunError("no agent task found; start with: agent-run start <name> ...")
+    candidates.sort(key=lambda value: task_state_path(root, value).stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def load_task(root: Path, requested: str | None) -> tuple[str, dict[str, Any]]:
+    task_id = resolve_task_id(root, requested)
+    path = task_state_path(root, task_id)
+    if not path.exists():
+        raise AgentRunError(f"task not found: {path}")
+    return task_id, json.loads(path.read_text(encoding="utf-8"))
+
+
+def status_paths(status: str) -> list[str]:
+    return parse_porcelain_paths(status)
+
+
+def path_in_scope(path: str, scope: str) -> bool:
+    clean_path = Path(path).as_posix().lstrip("./")
+    clean_scope = Path(scope).as_posix().lstrip("./").rstrip("/")
+    if not clean_scope or clean_scope == ".":
+        return True
+    if any(char in clean_scope for char in "*?["):
+        return fnmatch.fnmatch(clean_path, clean_scope)
+    return clean_path == clean_scope or clean_path.startswith(clean_scope + "/")
+
+
+def is_normal_receipt(path: str) -> bool:
+    return path == ".codex" or path.startswith(".codex/") or path.startswith(
+        "docs/smartex-agent/runs/"
+    )
+
+
+def owned_dirty_paths(status: str, ownership: list[str]) -> list[str]:
+    return sorted(
+        path
+        for path in status_paths(status)
+        if not is_normal_receipt(path) and any(path_in_scope(path, scope) for scope in ownership)
+    )
+
+
+def find_json_values(value: Any, keys: set[str]) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in keys and isinstance(child, str) and child:
+                found.append(child)
+            found.extend(find_json_values(child, keys))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(find_json_values(child, keys))
+    return found
+
+
+def parse_task_log(path: Path) -> tuple[str | None, str | None]:
+    if not path.exists():
+        return None, None
+    session_ids: list[str] = []
+    texts: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session_ids.extend(find_json_values(payload, {"sessionID", "sessionId", "session_id"}))
+        if isinstance(payload, dict):
+            part = payload.get("part")
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif payload.get("type") == "result" and isinstance(payload.get("result"), str):
+                texts.append(payload["result"])
+            elif payload.get("type") in {"text", "result"} and isinstance(payload.get("text"), str):
+                texts.append(payload["text"])
+    return (session_ids[-1] if session_ids else None, texts[-1] if texts else None)
+
+
+def backend_label(backend: str | None) -> str:
+    return {
+        "claude": "Claude",
+        "opencode": "OpenCode",
+    }.get(backend or "opencode", backend or "OpenCode")
+
+
+def backend_executable(backend: str | None) -> str:
+    if backend == "claude":
+        return os.environ.get("AGENT_RUN_CLAUDE", "claude")
+    return os.environ.get("AGENT_RUN_OPENCODE", "opencode")
+
+
+def task_generation_paths(root: Path, task: dict[str, Any]) -> tuple[Path, Path]:
+    generation = int(task.get("generation", 1))
+    base = task_root(root, task["task_id"])
+    return base / "logs" / f"{generation:03d}.jsonl", base / "state" / f"exit-{generation:03d}"
+
+
+def task_log_metadata(root: Path, task: dict[str, Any]) -> dict[str, Any]:
+    log_path, _ = task_generation_paths(root, task)
+    size = log_path.stat().st_size if log_path.exists() else 0
+    return {
+        "path": str(log_path),
+        "bytes": size,
+        "exists": log_path.exists(),
+        "mtime": datetime.fromtimestamp(log_path.stat().st_mtime).astimezone().isoformat(timespec="seconds")
+        if log_path.exists()
+        else None,
+    }
+
+
+def stall_threshold_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_STALL_SECONDS")
+    if not raw:
+        return DEFAULT_STALL_SECONDS
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return DEFAULT_STALL_SECONDS
+
+
+def update_task_observability(root: Path, task: dict[str, Any]) -> None:
+    task["log"] = task_log_metadata(root, task)
+    if task.get("status") != "running":
+        task.pop("stalled_warning", None)
+        return
+
+    elapsed = elapsed_seconds(task.get("launched_at"))
+    threshold = stall_threshold_seconds()
+    has_session = bool(task.get("worker_session_id") or task.get("opencode_session_id"))
+    changed = bool(task.get("changed_owned_files"))
+    log_bytes = int(task.get("log", {}).get("bytes") or 0)
+    if (
+        task.get("backend") != "claude"
+        and elapsed is not None
+        and elapsed >= threshold
+        and not has_session
+        and not changed
+        and log_bytes == 0
+    ):
+        task["stalled_warning"] = {
+            "kind": "backend_no_output",
+            "elapsed_seconds": int(elapsed),
+            "threshold_seconds": int(threshold),
+            "message": (
+                "worker has no captured session, no owned-file changes, and an empty log; "
+                "backend may be stuck during startup or first response"
+            ),
+        }
+    else:
+        task.pop("stalled_warning", None)
+
+
+def refresh_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
+    log_path, exit_path = task_generation_paths(root, task)
+    session_id, result = parse_task_log(log_path)
+    if session_id:
+        task["worker_session_id"] = session_id
+        task["opencode_session_id"] = session_id
+    if result:
+        result_path = task_root(root, task["task_id"]) / "result.md"
+        result_path.write_text(result.rstrip() + "\n", encoding="utf-8")
+        task["result"] = str(result_path)
+
+    current_head = git(root, ["rev-parse", "HEAD"], check=True)
+    just_finished = False
+    if task.get("status") == "running" and exit_path.exists():
+        raw = exit_path.read_text(encoding="utf-8").strip()
+        try:
+            exit_code = int(raw)
+        except ValueError:
+            exit_code = 1
+        task["exit_code"] = exit_code
+        task["status"] = "completed" if exit_code == 0 else "failed"
+        task["finished_at"] = now()
+        task["worker_finished_head"] = current_head
+        just_finished = True
+    elif task.get("status") == "running" and not tmux_has_session(task["tmux_session"]):
+        task["exit_code"] = None
+        task["status"] = "failed"
+        task["finished_at"] = now()
+        task["last_error"] = "background tmux session disappeared without an exit receipt"
+        task["worker_finished_head"] = current_head
+        just_finished = True
+
+    task["current_head"] = current_head
+    current_status = git(root, ["status", "--porcelain", "--untracked-files=all"], check=True)
+    current_changed = owned_dirty_paths(current_status, task["ownership"]["own"])
+    if task.get("status") == "running" or just_finished or "changed_owned_files" not in task:
+        task["changed_owned_files"] = current_changed
+    if just_finished and current_head != task["base_sha"]:
+        task["policy_violation"] = "repository HEAD changed while worker commit policy was coordinator-owned"
+        task["status"] = "failed"
+
+    update_task_observability(root, task)
+    save_task(root, task)
+    return task
+
+
+def render_task_prompt(task: dict[str, Any], spec_text: str) -> str:
+    owns = "\n".join(f"- {value}" for value in task["ownership"]["own"])
+    avoids = "\n".join(f"- {value}" for value in task["ownership"]["avoid"]) or "- Anything outside Own."
+    non_goals = "\n".join(f"- {value}" for value in task["ownership"]["non_goals"]) or "- Do not broaden scope."
+    gates = "\n".join(f"- `{value}`" for value in task["gates"]) or "- No worker gate declared; report that explicitly."
+    claims = ""
+    if task.get("claims_audit"):
+        claims = "\n- For readiness, compliance, deployment, benchmark, or runtime claims, state claims made, claims intentionally not made, and direct evidence."
+    label = backend_label(task.get("backend"))
+    return f"""# {label} Worker Task: {task['name']}
+
+Objective:
+{task['objective']}
+
+Purpose and implementation context:
+{spec_text.rstrip()}
+
+Repository contract:
+- Repo: {task['repo']}
+- Base branch: {task['base_branch']}
+- Base SHA: {task['base_sha']}
+- Worker backend: {label}
+- Worker agent: {task.get('agent') or '<backend default>'}
+- Commit policy: coordinator-owned
+
+Own:
+{owns}
+
+Avoid:
+{avoids}
+
+Non-goals:
+{non_goals}
+
+Rules:
+- Work directly in the repository above.
+- Read before writing and make the smallest correct change.
+- Do not spawn implementation subagents.
+- Do not commit, push, merge, rebase, stash, or change branches.
+- Do not edit outside Own.
+- Preserve unrelated existing changes.
+- If blocked, stop and report the exact blocker instead of broadening scope.{claims}
+
+Worker verification:
+{gates}
+
+Final response, concise and without a work story:
+Status: complete | blocked
+Files changed: <paths>
+Gates: <commands and observed result>
+Review flags: <areas Codex should inspect closely, or none>
+Unresolved risks: <risks, or none>
+"""
+
+
+def write_task_launch_script(root: Path, task: dict[str, Any], *, continuation_file: Path | None = None) -> Path:
+    generation = int(task["generation"])
+    base = task_root(root, task["task_id"])
+    script = base / "bin" / f"launch-{generation:03d}.sh"
+    log_path, exit_path = task_generation_paths(root, task)
+    prompt_path = continuation_file or Path(task["prompt"])
+    model_flags = ""
+    if task.get("model"):
+        model_flags += f"  --model {json.dumps(task['model'])} \\\n"
+    if task.get("variant"):
+        model_flags += f"  --variant {json.dumps(task['variant'])} \\\n"
+    backend = task.get("backend", "opencode")
+    instruction = (
+        "Continue the same implementation task using the attached coordinator correction. "
+        "Do not commit or push. Return only the compact task report."
+        if continuation_file
+        else "Follow the attached worker task exactly. Do not commit or push. Return only the compact task report."
+    )
+    if backend == "claude":
+        claude_model_flags = ""
+        if task.get("model"):
+            claude_model_flags += f"  --model {json.dumps(task['model'])} \\\n"
+        if task.get("variant"):
+            claude_model_flags += f"  --effort {json.dumps(task['variant'])} \\\n"
+        agent_flags = ""
+        if task.get("agent"):
+            agent_flags = f"  --agent {json.dumps(task['agent'])} \\\n"
+        resume_flags = ""
+        if continuation_file:
+            resume_flags = f"  --resume {json.dumps(task.get('worker_session_id') or task.get('opencode_session_id'))} \\\n"
+        text = f"""#!/usr/bin/env bash
+set -uo pipefail
+CLAUDE_BIN="${{AGENT_RUN_CLAUDE:-claude}}"
+cd {json.dumps(str(root))}
+mkdir -p {json.dumps(str(log_path.parent))} {json.dumps(str(exit_path.parent))}
+{{
+  cat {json.dumps(str(prompt_path))}
+  printf '\\n\\nCoordinator instruction:\\n%s\\n' {json.dumps(instruction)}
+}} | "$CLAUDE_BIN" \\
+  --print \\
+  --output-format json \\
+  --permission-mode bypassPermissions \\
+  --setting-sources user \\
+  --disable-slash-commands \\
+{agent_flags}{claude_model_flags}{resume_flags}  --name {json.dumps('agent-task/' + task['task_id'])} > {json.dumps(str(log_path))} 2>&1
+code=$?
+printf '%s\n' "$code" > {json.dumps(str(exit_path))}
+exit "$code"
+"""
+    elif backend == "opencode":
+        session_flags = ""
+        if continuation_file:
+            session_flags = f"  --session {json.dumps(task['opencode_session_id'])} \\\n"
+        text = f"""#!/usr/bin/env bash
+set -uo pipefail
+OPENCODE_BIN="${{AGENT_RUN_OPENCODE:-opencode}}"
+cd {json.dumps(str(root))}
+mkdir -p {json.dumps(str(log_path.parent))} {json.dumps(str(exit_path.parent))}
+"$OPENCODE_BIN" run \\
+  --agent {json.dumps(task['agent'])} \\
+{model_flags}{session_flags}  --format json \\
+  --dir {json.dumps(str(root))} \\
+  --title {json.dumps('agent-task/' + task['task_id'])} \\
+  --file {json.dumps(str(prompt_path))} \\
+  -- \\
+  {json.dumps(instruction)} > {json.dumps(str(log_path))} 2>&1
+code=$?
+printf '%s\n' "$code" > {json.dumps(str(exit_path))}
+exit "$code"
+"""
+    else:
+        raise AgentRunError(f"unsupported agent-run backend: {backend}")
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(text, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def launch_task(root: Path, task: dict[str, Any], script: Path, *, foreground: bool) -> int:
+    task["status"] = "running"
+    task["launched_at"] = now()
+    save_task(root, task)
+    if foreground:
+        proc = subprocess.run([str(script)])
+        refresh_task(root, task)
+        return proc.returncode
+    session = task["tmux_session"]
+    if tmux_has_session(session):
+        run_cmd(["tmux", "kill-session", "-t", session], check=False)
+    run_cmd(["tmux", "new-session", "-d", "-s", session, "-n", "worker", str(script)])
+    return 0
+
+
+def active_checkout_tasks(root: Path) -> list[str]:
+    active: list[str] = []
+    for path in tasks_root(root).glob("*/task.json"):
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if task.get("status") == "running":
+            task = refresh_task(root, task)
+        if task.get("status") == "running":
+            active.append(task["task_id"])
+    return active
+
+
+def command_task_start(args: argparse.Namespace) -> int:
+    root = repo_root()
+    active = active_checkout_tasks(root)
+    if active:
+        raise AgentRunError(
+            "a writable checkout task is already running: " + ", ".join(active) + ". Wait or stop it first."
+        )
+    require_lane_name(args.name)
+    ownership = args.own or ([] if not args.allow_broad_scope else ["."])
+    if not ownership:
+        raise AgentRunError("declare at least one --own path, or use --allow-broad-scope")
+    full_status = git(root, ["status", "--porcelain", "--untracked-files=all"], check=True)
+    conflicts = owned_dirty_paths(full_status, ownership)
+    if conflicts:
+        raise AgentRunError(
+            "worker-owned paths already contain changes; commit/review them first or choose another scope:\n"
+            + "\n".join(conflicts)
+        )
+
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    task_id = f"{stamp}-{slugify(args.name)}"
+    suffix = 2
+    while task_state_path(root, task_id).exists():
+        task_id = f"{stamp}-{slugify(args.name)}-{suffix}"
+        suffix += 1
+    base = task_root(root, task_id)
+    for directory in ["bin", "logs", "state", "continuations"]:
+        (base / directory).mkdir(parents=True, exist_ok=True)
+    base_sha = git(root, ["rev-parse", args.base_ref], check=True)
+    checkout_head = git(root, ["rev-parse", "HEAD"], check=True)
+    if base_sha != checkout_head:
+        raise AgentRunError("sequential checkout tasks must start from the current HEAD")
+    base_branch = git(root, ["branch", "--show-current"], check=True) or "DETACHED"
+    worker_backend = args.backend
+    worker_agent = args.agent
+    if worker_backend == "opencode" and not worker_agent:
+        worker_agent = os.environ.get("AGENT_RUN_WORKER_AGENT", os.environ.get("AGENT_RUN_OPENCODE_AGENT", "build"))
+    worker_bin = backend_executable(worker_backend)
+    runner_path = Path(__file__).resolve()
+    spec_text = ""
+    if args.spec:
+        spec_path = abs_from_repo(root, args.spec)
+        if not spec_path.exists():
+            raise AgentRunError(f"spec file not found: {spec_path}")
+        spec_text = spec_path.read_text(encoding="utf-8")
+    task: dict[str, Any] = {
+        "schema_version": TASK_SCHEMA_VERSION,
+        "runner_version": VERSION,
+        "runner_sha256": sha256_file(runner_path),
+        "task_id": task_id,
+        "name": args.name,
+        "created_at": now(),
+        "updated_at": now(),
+        "repo": str(root),
+        "base_branch": base_branch,
+        "base_sha": base_sha,
+        "current_head": base_sha,
+        "baseline_status": full_status.splitlines(),
+        "objective": args.objective,
+        "ownership": {
+            "own": ownership,
+            "avoid": args.avoid or [],
+            "non_goals": args.non_goal or [],
+        },
+        "gates": args.gate or [],
+        "claims_audit": bool(args.claims_audit),
+        "agent": worker_agent,
+        "backend": worker_backend,
+        "model": args.model,
+        "variant": args.variant,
+        "commit_policy": "coordinator",
+        "worker": executable_version(worker_bin),
+        "opencode": executable_version(os.environ.get("AGENT_RUN_OPENCODE", "opencode")),
+        "claude": executable_version(os.environ.get("AGENT_RUN_CLAUDE", "claude")),
+        "config_fingerprints": config_fingerprints(root),
+        "status": "planned",
+        "generation": 1,
+        "tmux_session": f"agent-task-{task_id}"[:80],
+    }
+    prompt_path = base / "prompt.md"
+    prompt_text = render_task_prompt(task, spec_text)
+    prompt_path.write_text(prompt_text, encoding="utf-8")
+    task["prompt"] = str(prompt_path)
+    task["prompt_sha256"] = sha256_bytes(prompt_text.encode("utf-8"))
+    script = write_task_launch_script(root, task)
+    task["launch_script"] = str(script)
+    save_task(root, task)
+    current_task_file(root).parent.mkdir(parents=True, exist_ok=True)
+    current_task_file(root).write_text(task_id + "\n", encoding="utf-8")
+    rc = launch_task(root, task, script, foreground=args.foreground)
+    print(f"task: {task_id}")
+    print(f"status: {task['status']}")
+    print(f"state: {task_state_path(root, task_id)}")
+    return rc
+
+
+def print_task_status(task: dict[str, Any]) -> None:
+    print(f"task: {task['task_id']}")
+    print(f"status: {task['status']}")
+    print(f"base: {task['base_branch']} {task['base_sha'][:12]}")
+    print(f"backend: {task.get('backend', 'opencode')}")
+    print(f"agent: {task.get('agent') or '<backend default>'}")
+    print(f"model: {task.get('model') or '<agent default>'}")
+    if task.get("variant"):
+        print(f"variant: {task['variant']}")
+    print(f"generation: {task.get('generation', 1)}")
+    print(f"elapsed: {format_duration(elapsed_seconds(task.get('launched_at') or task.get('created_at')))}")
+    print(f"session: {task.get('worker_session_id') or task.get('opencode_session_id') or '<pending>'}")
+    log = task.get("log") or {}
+    if log:
+        print(f"log: {log.get('path')} ({log.get('bytes', 0)} bytes)")
+    print(f"changed: {', '.join(task.get('changed_owned_files', [])) or '<none>'}")
+    if task.get("policy_violation"):
+        print(f"policy violation: {task['policy_violation']}")
+    if task.get("stop_reason"):
+        print(f"stop reason: {task['stop_reason']}")
+    if task.get("stalled_warning"):
+        warning = task["stalled_warning"]
+        print(f"warning: {warning['kind']} after {format_duration(warning.get('elapsed_seconds'))}: {warning['message']}")
+    if task.get("result"):
+        print(f"result: {task['result']}")
+
+
+def print_task_heartbeat(task: dict[str, Any]) -> None:
+    log = task.get("log") or {}
+    session = task.get("worker_session_id") or task.get("opencode_session_id") or "<pending>"
+    changed = ",".join(task.get("changed_owned_files", [])) or "<none>"
+    line = (
+        f"[agent-run] {task['task_id']} status={task['status']} "
+        f"backend={task.get('backend', 'opencode')} elapsed={format_duration(elapsed_seconds(task.get('launched_at')))} "
+        f"session={session} log_bytes={log.get('bytes', 0)} changed={changed}"
+    )
+    print(line, file=sys.stderr)
+    if task.get("stalled_warning"):
+        print(f"[agent-run] warning: {task['stalled_warning']['message']}", file=sys.stderr)
+
+
+def command_task_status(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, task = load_task(root, args.task)
+    task = refresh_task(root, task)
+    print_task_status(task)
+    return 0 if task["status"] != "failed" else 1
+
+
+def command_status_dispatch(args: argparse.Namespace) -> int:
+    root = repo_root()
+    if getattr(args, "watch", False):
+        while True:
+            if getattr(args, "task", None) or not getattr(args, "run", None):
+                _, task = load_task(root, getattr(args, "task", None))
+                task = refresh_task(root, task)
+                print_task_status(task)
+                if task["status"] != "running":
+                    return 0 if task["status"] != "failed" else 1
+            else:
+                rc = command_status(args)
+                if rc != 0:
+                    return rc
+            time.sleep(args.interval)
+            print("", flush=True)
+    if getattr(args, "task", None) or not getattr(args, "run", None):
+        try:
+            _, task = load_task(root, getattr(args, "task", None))
+        except AgentRunError:
+            if getattr(args, "task", None):
+                raise
+        else:
+            task = refresh_task(root, task)
+            print_task_status(task)
+            return 0 if task["status"] != "failed" else 1
+    return command_status(args)
+
+
+def command_task_wait(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, task = load_task(root, args.task)
+    deadline = None if args.timeout == 0 else time.monotonic() + args.timeout
+    next_heartbeat = time.monotonic()
+    while True:
+        task = refresh_task(root, task)
+        if args.heartbeat and time.monotonic() >= next_heartbeat:
+            print_task_heartbeat(task)
+            next_heartbeat = time.monotonic() + args.heartbeat
+        if task["status"] != "running":
+            print_task_status(task)
+            return 0 if task["status"] == "completed" else 1
+        if deadline is not None and time.monotonic() >= deadline:
+            print_task_status(task)
+            print("wait timed out", file=sys.stderr)
+            return 124
+        time.sleep(args.interval)
+
+
+def command_task_tail(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, task = load_task(root, args.task)
+    task = refresh_task(root, task)
+    log_path = Path((task.get("log") or {}).get("path") or "")
+    if not log_path.exists():
+        print_task_status(task)
+        print("no log file exists yet", file=sys.stderr)
+        return 1
+    cmd = ["tail", "-n", str(args.lines)]
+    if args.follow:
+        cmd.append("-f")
+    cmd.append(str(log_path))
+    return subprocess.run(cmd).returncode
+
+
+def command_task_result(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, task = load_task(root, args.task)
+    task = refresh_task(root, task)
+    result_path = Path(task.get("result", ""))
+    if result_path.is_file():
+        print(result_path.read_text(encoding="utf-8").rstrip())
+    else:
+        print_task_status(task)
+        print("no compact result found; inspect logs", file=sys.stderr)
+        return 1
+    return 0 if task["status"] == "completed" else 1
+
+
+def command_task_continue(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, task = load_task(root, args.task)
+    task = refresh_task(root, task)
+    if task["status"] == "running":
+        raise AgentRunError("task is still running; wait or stop it before continuing")
+    session_id = task.get("worker_session_id") or task.get("opencode_session_id")
+    if not session_id:
+        raise AgentRunError("task has no captured worker session ID and cannot be continued safely")
+    message = args.message
+    if args.message_file:
+        source = abs_from_repo(root, args.message_file)
+        if not source.exists():
+            raise AgentRunError(f"message file not found: {source}")
+        message = source.read_text(encoding="utf-8")
+    if not message:
+        raise AgentRunError("provide --message or --message-file")
+    task["generation"] = int(task.get("generation", 1)) + 1
+    continuation = task_root(root, task["task_id"]) / "continuations" / f"{task['generation']:03d}.md"
+    continuation.write_text(
+        "# Coordinator Correction\n\n" + message.rstrip() + "\n\n"
+        "Keep the original ownership, non-goals, no-commit policy, and compact final response contract.\n",
+        encoding="utf-8",
+    )
+    task.setdefault("continuations", []).append({"generation": task["generation"], "path": str(continuation)})
+    task.pop("exit_code", None)
+    task.pop("finished_at", None)
+    task.pop("policy_violation", None)
+    script = write_task_launch_script(root, task, continuation_file=continuation)
+    task["launch_script"] = str(script)
+    rc = launch_task(root, task, script, foreground=args.foreground)
+    print(f"task: {task['task_id']}")
+    print(f"status: {task['status']}")
+    print(f"session: {session_id}")
+    return rc
+
+
+def command_task_stop(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, task = load_task(root, args.task)
+    task = refresh_task(root, task)
+    if task["status"] == "running":
+        run_cmd(["tmux", "kill-session", "-t", task["tmux_session"]], check=False)
+        task["status"] = "stopped"
+        task["finished_at"] = now()
+        task["stop_reason"] = args.reason or "stopped_by_coordinator"
+        save_task(root, task)
+    print_task_status(task)
+    return 0
+
+
+def write_readme(root: Path, manifest: dict[str, Any]) -> None:
+    text = f"""# Agent Run: {manifest['run_id']}
+
+This directory is the durable control plane for a Codex-led, OpenCode-implemented run.
+
+- `manifest.json`: source of truth
+- `spec.md`: run-level goal/spec
+- `specs/*.md`: lane specs
+- `prompts/*.md`: self-contained worker prompts
+- `reports/*.md`: required worker reports
+- `verification/verifier-prompt.md`: integration verifier prompt
+- `verification/verifier-report.md`: required verifier report
+
+Workers edit only their assigned worktree and never push.
+Coordinator integrates accepted output into `{manifest['integration_branch']}`.
+"""
+    (run_root(root, manifest["run_id"]) / "README.md").write_text(text, encoding="utf-8")
+
+
+def command_init(args: argparse.Namespace) -> int:
+    root = repo_root()
+    ensure_clean(root, allow_dirty=args.allow_dirty)
+    name_slug = slugify(args.name)
+    run_id = args.run_id or f"{today()}-{name_slug}"
+    run_id = slugify(run_id)
+    path = manifest_path(root, run_id)
+    if path.exists() and not args.reuse:
+        raise AgentRunError(f"run already exists: {run_id} (use --reuse to keep using it)")
+
+    base_sha = git(root, ["rev-parse", args.base_ref], check=True)
+    base_branch = git(root, ["branch", "--show-current"], check=True) or "DETACHED"
+    status = git(root, ["status", "--porcelain", "--untracked-files=no"], check=True)
+
+    ensure_run_dirs(root, run_id)
+    spec_path = run_root(root, run_id) / "spec.md"
+    if args.goal_file:
+        source = Path(args.goal_file).expanduser()
+        if not source.is_absolute():
+            source = Path.cwd() / source
+        if not source.exists():
+            raise AgentRunError(f"goal file not found: {source}")
+        shutil.copyfile(source, spec_path)
+    elif args.goal:
+        spec_path.write_text(args.goal.rstrip() + "\n", encoding="utf-8")
+    elif not spec_path.exists():
+        spec_path.write_text(
+            "# Run Spec\n\nGoal:\n\nConstraints:\n\nAcceptance gates:\n\n",
+            encoding="utf-8",
+        )
+
+    manifest: dict[str, Any] = {
+        "version": VERSION,
+        "tool": "agent-run",
+        "run_id": run_id,
+        "name": args.name,
+        "created_at": now(),
+        "updated_at": now(),
+        "repo": str(root),
+        "base_branch": base_branch,
+        "base_sha": base_sha,
+        "dirty_at_init": bool(status),
+        "dirty_policy": "tracked-files-only",
+        "dirty_snapshot": status.splitlines(),
+        "global_gates": args.gate or [],
+        "integration_branch": f"integrate/{run_id}",
+        "integration_worktree": str(root / ".worktrees" / "agents" / run_id / "integration"),
+        "tmux_session": f"agent-run-{run_id}"[:80],
+        "lanes": [],
+        "verification": {
+            "status": "not_started",
+            "prompt": str(run_root(root, run_id) / "verification" / "verifier-prompt.md"),
+            "report": str(run_root(root, run_id) / "verification" / "verifier-report.md"),
+        },
+        "events": [{"at": now(), "type": "init"}],
+    }
+    save_manifest(root, manifest)
+    write_readme(root, manifest)
+    current_run_file(root).parent.mkdir(parents=True, exist_ok=True)
+    current_run_file(root).write_text(run_id + "\n", encoding="utf-8")
+
+    print(f"run: {run_id}")
+    print(f"manifest: {path}")
+    print(f"base: {base_branch} {base_sha[:12]}")
+    if status:
+        print("dirty-base: tracked changes recorded")
+        print("recommendation: use `agent-run prompt ...` or commit/stash before adding writable lanes")
+    return 0
+
+
+def commit_policy_text(policy: str) -> tuple[str, str, str]:
+    if policy == "worker":
+        return (
+            "- Commit your completed lane locally before reporting done.",
+            "- final commit SHA",
+            "You are done only when your branch has a local commit ahead of the base SHA and the report exists.",
+        )
+    return (
+        "- Do not commit unless the coordinator explicitly asks you to. Leave reviewed changes in the worktree.",
+        "- commit status: `not committed; coordinator-owned commit policy` unless explicitly told otherwise",
+        "You are done when your worktree contains the requested changes, gates have run, and the report exists. The coordinator will review, integrate, and commit.",
+    )
+
+
+def render_worker_prompt(
+    *,
+    manifest: dict[str, Any],
+    lane: dict[str, Any],
+    spec_text: str,
+    gate_commands: list[str],
+) -> str:
+    gates = "\n".join(f"- `{cmd}`" for cmd in gate_commands) or "- No gate declared. Ask the coordinator before claiming done."
+    owns = "\n".join(f"- {p}" for p in lane["ownership"]["own"])
+    avoids = "\n".join(f"- {p}" for p in lane["ownership"].get("avoid", [])) or "- Anything outside Own."
+    non_goals = "\n".join(f"- {p}" for p in lane["ownership"].get("non_goals", [])) or "- Do not broaden scope beyond this lane."
+    commit_rule, commit_report_line, completion_contract = commit_policy_text(
+        lane.get("commit_policy", "coordinator")
+    )
+    return f"""# Worker Lane: {lane['name']}
+
+Objective:
+{lane['objective']}
+
+Run context:
+- Run id: {manifest['run_id']}
+- Repo: {manifest['repo']}
+- Base branch: {manifest['base_branch']}
+- Base SHA: {manifest['base_sha']}
+- Your branch: {lane['branch']}
+- Your worktree: {lane['worktree']}
+- OpenCode agent: {lane['agent']}
+- OpenCode model override: {lane.get('model') or '<default from agent/config>'}
+- OpenCode variant override: {lane.get('variant') or '<default from agent/config>'}
+- Commit policy: {lane.get('commit_policy', 'coordinator')}
+- Required report: {lane['report']}
+
+Lane spec:
+{spec_text.rstrip()}
+
+Scope ownership:
+Own:
+{owns}
+
+Avoid:
+{avoids}
+
+Non-goals:
+{non_goals}
+
+Implementation rules:
+- Start by running `git status --short` and confirming you are in the worktree above.
+- Read before writing.
+- Make the smallest correct change that satisfies this lane.
+- Do not edit outside this worktree.
+- Do not merge, rebase, push, or touch the integration branch.
+- Do not change files owned by another lane unless the coordinator explicitly amended this prompt.
+{commit_rule}
+- If blocked, do not invent scope. Write the blocker into the report and stop.
+
+Truth discipline:
+- Do not infer product readiness from artifact presence.
+- A receipt proves only what its schema explicitly states.
+- If evidence is ambiguous, classify it as partial, not ready.
+- Prefer false negatives over false positives.
+- Separate implemented behavior from verified product truth.
+- Do not claim deployed/customer/runtime readiness unless direct evidence proves that exact claim.
+
+Verification:
+Run these commands from the worktree before reporting done:
+{gates}
+
+Final report:
+Write `{lane['report']}` with:
+- branch
+- {commit_report_line}
+- files changed
+- checks run and observed result
+- risks/blockers
+- merge recommendation
+- claims made
+- claims intentionally not made
+- evidence for each claim
+- ambiguous evidence
+- recommended reviewer checks
+
+Completion contract:
+{completion_contract}
+"""
+
+
+def command_add(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, manifest = load_manifest(root, args.run)
+    if manifest.get("dirty_at_init") and not args.allow_dirty_base:
+        dirty_lines = manifest.get("dirty_snapshot") or []
+        detail = "\n".join(dirty_lines[:40])
+        more = "" if len(dirty_lines) <= 40 else f"\n... {len(dirty_lines) - 40} more tracked entries"
+        raise AgentRunError(
+            "this run was initialized from a tracked-dirty checkout. Writable worktree lanes usually lose "
+            "active main-checkout context and become slow to integrate.\n"
+            "Recommended: use `agent-run prompt ...` for a direct OpenCode prompt, or commit/stash first.\n"
+            "Override only when you intentionally want a worker from the dirty base: --allow-dirty-base\n"
+            + detail
+            + more
+        )
+    lane_name = args.lane
+    require_lane_name(lane_name)
+    if any(l["name"] == lane_name for l in manifest.get("lanes", [])):
+        raise AgentRunError(f"lane already exists: {lane_name}")
+    if not args.own and not args.allow_broad_scope:
+        raise AgentRunError("add at least one --own path, or pass --allow-broad-scope explicitly")
+
+    for existing in manifest.get("lanes", []):
+        for a in args.own or []:
+            for b in existing.get("ownership", {}).get("own", []):
+                if path_overlap(a, b) and not args.allow_overlap:
+                    raise AgentRunError(
+                        f"ownership overlap: {lane_name}:{a} overlaps {existing['name']}:{b} "
+                        "(use --allow-overlap only when the coordinator will serialize edits)"
+                    )
+
+    ensure_run_dirs(root, manifest["run_id"])
+    spec_path = run_root(root, manifest["run_id"]) / "specs" / f"{lane_name}.md"
+    if args.spec:
+        source = Path(args.spec).expanduser()
+        if not source.is_absolute():
+            source = Path.cwd() / source
+        if not source.exists():
+            raise AgentRunError(f"lane spec not found: {source}")
+        shutil.copyfile(source, spec_path)
+    else:
+        spec_path.write_text(args.objective.rstrip() + "\n", encoding="utf-8")
+
+    branch = f"agent/{manifest['run_id']}/{lane_name}"
+    worktree = root / ".worktrees" / "agents" / manifest["run_id"] / lane_name
+    if branch_exists(root, branch):
+        if not args.reuse:
+            raise AgentRunError(f"branch already exists: {branch} (use --reuse to attach)")
+    else:
+        git(root, ["branch", branch, manifest["base_sha"]], check=True)
+
+    if worktree.exists() or worktree_registered(root, worktree):
+        if not args.reuse:
+            raise AgentRunError(f"worktree already exists: {worktree} (use --reuse to attach)")
+    else:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        git(root, ["worktree", "add", str(worktree), branch], check=True)
+
+    report_path = run_root(root, manifest["run_id"]) / "reports" / f"{lane_name}.md"
+    prompt_path = run_root(root, manifest["run_id"]) / "prompts" / f"{lane_name}.md"
+    gate_commands = args.gate or manifest.get("global_gates", [])
+    lane = {
+        "name": lane_name,
+        "agent": args.agent,
+        "model": args.model,
+        "variant": args.variant,
+        "commit_policy": args.commit_policy,
+        "objective": args.objective,
+        "branch": branch,
+        "worktree": str(worktree),
+        "spec": str(spec_path),
+        "prompt": str(prompt_path),
+        "report": str(report_path),
+        "status": "planned",
+        "ownership": {
+            "own": args.own or ["<broad-scope-approved>"],
+            "avoid": args.avoid or [],
+            "non_goals": args.non_goal or [],
+        },
+        "gates": gate_commands,
+        "created_at": now(),
+    }
+    spec_text = spec_path.read_text(encoding="utf-8")
+    prompt_path.write_text(
+        render_worker_prompt(manifest=manifest, lane=lane, spec_text=spec_text, gate_commands=gate_commands),
+        encoding="utf-8",
+    )
+    manifest["lanes"].append(lane)
+    manifest.setdefault("events", []).append({"at": now(), "type": "add_lane", "lane": lane_name})
+    save_manifest(root, manifest)
+
+    print(f"lane: {lane_name}")
+    print(f"branch: {branch}")
+    print(f"worktree: {worktree}")
+    print(f"prompt: {prompt_path}")
+    return 0
+
+
+def command_prompt(args: argparse.Namespace) -> int:
+    root = repo_root()
+    base_sha = git(root, ["rev-parse", args.base_ref], check=True)
+    base_branch = git(root, ["branch", "--show-current"], check=True) or "DETACHED"
+    status = tracked_status(root)
+    lane_name = args.lane
+    require_lane_name(lane_name)
+    if not args.own and not args.allow_broad_scope:
+        raise AgentRunError("add at least one --own path, or pass --allow-broad-scope explicitly")
+
+    if args.goal_file:
+        source = Path(args.goal_file).expanduser()
+        if not source.is_absolute():
+            source = Path.cwd() / source
+        if not source.exists():
+            raise AgentRunError(f"goal file not found: {source}")
+        spec_text = source.read_text(encoding="utf-8")
+    elif args.goal:
+        spec_text = args.goal
+    else:
+        spec_text = args.objective
+
+    if status:
+        spec_text = (
+            "Coordinator note:\n"
+            "- The current checkout has tracked uncommitted changes. Treat this prompt as a direct worker "
+            "worker prompt for the active checkout, not as an isolated worktree lane.\n"
+            "- Do not assume a clean-base worktree can see those uncommitted changes. If implementation depends "
+            "on them, inspect the active checkout state first.\n"
+            "- Return a patch/report; Codex remains responsible for integration and final verification.\n\n"
+            "Tracked dirty files at prompt creation:\n"
+            + "\n".join(f"- {line}" for line in status.splitlines())
+            + "\n\n"
+            + spec_text
+        )
+
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    out_dir = prompt_only_root(root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = Path(args.output).expanduser() if args.output else out_dir / f"{stamp}-{lane_name}.md"
+    if not prompt_path.is_absolute():
+        prompt_path = root / prompt_path
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "run_id": f"prompt-only-{stamp}",
+        "repo": str(root),
+        "base_branch": base_branch,
+        "base_sha": base_sha,
+    }
+    lane = {
+        "name": lane_name,
+        "objective": args.objective,
+        "branch": "<direct-worker-session>",
+        "worktree": str(root),
+        "agent": args.agent,
+        "model": args.model,
+        "variant": args.variant,
+        "commit_policy": "coordinator",
+        "report": "<return report in chat or write a repo-local report path requested by coordinator>",
+        "ownership": {
+            "own": args.own or ["<broad-scope-approved>"],
+            "avoid": args.avoid or [],
+            "non_goals": args.non_goal or [],
+        },
+    }
+    text = render_worker_prompt(
+        manifest=manifest,
+        lane=lane,
+        spec_text=spec_text,
+        gate_commands=args.gate or [],
+    )
+    text += (
+        "\nPrompt-only mode:\n"
+        "- This prompt did not create a branch, worktree, manifest, or tmux worker.\n"
+        "- Use it when Codex wants OpenCode help but the active checkout is dirty or moving quickly.\n"
+        "- Paste/use it directly in OpenCode, then let Codex review and integrate the result.\n"
+    )
+    prompt_path.write_text(text, encoding="utf-8")
+    print(f"prompt: {prompt_path}")
+    if status:
+        print("mode: prompt-only recommended because tracked files are dirty")
+    if args.stdout:
+        print()
+        print(text)
+    return 0
+
+
+def write_launch_script(root: Path, manifest: dict[str, Any], lane: dict[str, Any]) -> Path:
+    script = run_root(root, manifest["run_id"]) / "bin" / f"launch-{lane['name']}.sh"
+    log_path = run_root(root, manifest["run_id"]) / "logs" / f"{lane['name']}.log"
+    title = f"agent-run/{manifest['run_id']}/{lane['name']}"
+    model_flags = ""
+    if lane.get("model"):
+        model_flags += f"  --model {json.dumps(lane['model'])} \\\n"
+    if lane.get("variant"):
+        model_flags += f"  --variant {json.dumps(lane['variant'])} \\\n"
+    text = f"""#!/usr/bin/env bash
+set -euo pipefail
+OPENCODE_BIN="${{AGENT_RUN_OPENCODE:-opencode}}"
+cd {json.dumps(lane['worktree'])}
+mkdir -p {json.dumps(str(log_path.parent))}
+echo "[agent-run] started $(date -Is)" | tee -a {json.dumps(str(log_path))}
+echo "[agent-run] lane {lane['name']} worktree {lane['worktree']}" | tee -a {json.dumps(str(log_path))}
+exec "$OPENCODE_BIN" run \\
+  --agent {json.dumps(lane['agent'])} \\
+{model_flags}\
+  --dir {json.dumps(lane['worktree'])} \\
+  --title {json.dumps(title)} \\
+  --file {json.dumps(lane['prompt'])} \\
+  -- \\
+  "Follow the attached worker prompt exactly. Work only in the specified worktree. Do not push."
+"""
+    script.write_text(text, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def tmux_has_session(name: str) -> bool:
+    return run_cmd(["tmux", "has-session", "-t", name], check=False).returncode == 0
+
+
+def command_launch(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, manifest = load_manifest(root, args.run)
+    lanes = selected_lanes(manifest, args.lane)
+    if not lanes:
+        raise AgentRunError("no lanes to launch")
+    if args.all and args.lane:
+        raise AgentRunError("use either --all or --lane, not both")
+    if not args.all and not args.lane:
+        raise AgentRunError("choose --all or --lane <name>")
+
+    for lane in lanes:
+        if lane["status"] not in {"planned", "failed", "running"} and not args.force:
+            raise AgentRunError(f"lane {lane['name']} status is {lane['status']}; use --force to relaunch")
+        script = write_launch_script(root, manifest, lane)
+        lane["launch_script"] = str(script)
+        if args.foreground:
+            lane["status"] = "running"
+            lane["launched_at"] = now()
+            save_manifest(root, manifest)
+            proc = subprocess.run([str(script)])
+            if proc.returncode != 0:
+                lane["status"] = "failed"
+                lane["last_error"] = f"foreground launch exited {proc.returncode}"
+                save_manifest(root, manifest)
+                return proc.returncode
+        else:
+            session = manifest["tmux_session"]
+            window = lane["name"][:32]
+            if tmux_has_session(session):
+                run_cmd(["tmux", "new-window", "-t", session, "-n", window, str(script)], capture=True)
+            else:
+                run_cmd(["tmux", "new-session", "-d", "-s", session, "-n", window, str(script)], capture=True)
+            lane["status"] = "running"
+            lane["launched_at"] = now()
+            manifest.setdefault("events", []).append(
+                {"at": now(), "type": "launch_lane", "lane": lane["name"], "tmux_session": session}
+            )
+            print(f"launched {lane['name']} in tmux session {session}")
+    save_manifest(root, manifest)
+    return 0
+
+
+def parse_porcelain_paths(status: str) -> list[str]:
+    paths: list[str] = []
+    for line in status.splitlines():
+        if not line:
+            continue
+        if len(line) > 2 and line[2] == " ":
+            raw = line[3:]
+        elif len(line) > 1 and line[1] == " ":
+            # git() strips leading whitespace, collapsing " M path" to "M path".
+            raw = line[2:]
+        else:
+            raw = line
+        if " -> " in raw:
+            raw = raw.split(" -> ", 1)[1]
+        raw = raw.strip()
+        if raw:
+            paths.append(raw)
+    return sorted(set(paths))
+
+
+def lane_git_facts(root: Path, manifest: dict[str, Any], lane: dict[str, Any]) -> dict[str, Any]:
+    wt = Path(lane["worktree"])
+    facts: dict[str, Any] = {
+        "worktree_exists": wt.exists(),
+        "worktree_dirty": None,
+        "commits_ahead": 0,
+        "head": None,
+        "changed_files": [],
+        "dirty_files": [],
+        "status_lines": [],
+    }
+    if not wt.exists():
+        return facts
+    status = git(wt, ["status", "--porcelain"], check=True)
+    facts["worktree_dirty"] = bool(status)
+    facts["status_lines"] = status.splitlines()
+    facts["dirty_files"] = parse_porcelain_paths(status)
+    facts["head"] = git(wt, ["rev-parse", "HEAD"], check=True)
+    ahead = git(root, ["rev-list", "--count", f"{manifest['base_sha']}..{lane['branch']}"], check=True)
+    facts["commits_ahead"] = int(ahead or "0")
+    changed = git(root, ["diff", "--name-only", f"{manifest['base_sha']}..{lane['branch']}"], check=True)
+    facts["changed_files"] = sorted(
+        set([line for line in changed.splitlines() if line] + facts["dirty_files"])
+    )
+    return facts
+
+
+def parse_verifier_report(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip().upper()
+        if stripped.startswith("VERDICT:"):
+            verdict = stripped.split(":", 1)[1].strip().split()[0]
+            if verdict in {"PASS", "FAIL", "PARTIAL"}:
+                return verdict.lower()
+    return None
+
+
+def refresh_verification_status(manifest: dict[str, Any]) -> None:
+    verification = manifest.get("verification")
+    if not isinstance(verification, dict):
+        return
+    report = verification.get("report")
+    if not report:
+        return
+    verdict = parse_verifier_report(Path(report))
+    if verdict:
+        verification["status"] = verdict
+        verification["verdict"] = verdict.upper()
+        verification["reported_at"] = now()
+
+
+def command_collect(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, manifest = load_manifest(root, args.run)
+    lanes = selected_lanes(manifest, args.lane)
+    for lane in lanes:
+        facts = lane_git_facts(root, manifest, lane)
+        report_exists = Path(lane["report"]).exists()
+        lane["last_collect"] = {"at": now(), **facts, "report_exists": report_exists}
+        lane["commit_sha"] = facts["head"]
+        lane["changed_files"] = facts["changed_files"]
+        lane["commits_ahead"] = facts["commits_ahead"]
+        lane["worktree_dirty"] = facts["worktree_dirty"]
+        commit_policy = lane.get("commit_policy", "coordinator")
+        has_output = facts["commits_ahead"] > 0 or (
+            commit_policy == "coordinator" and bool(facts["worktree_dirty"])
+        )
+        if has_output and report_exists and lane["status"] not in {"integrated", "abandoned"}:
+            lane["status"] = "done"
+        elif lane["status"] == "running" and facts["commits_ahead"] == 0 and report_exists:
+            if commit_policy == "coordinator" and facts["worktree_dirty"]:
+                lane["status"] = "done"
+            else:
+                lane["status"] = "failed"
+                lane["last_error"] = "report exists but lane has no commit and no dirty coordinator-owned changes"
+        print(
+            f"{lane['name']}: status={lane['status']} commits={facts['commits_ahead']} "
+            f"dirty={facts['worktree_dirty']} report={report_exists}"
+        )
+    refresh_verification_status(manifest)
+    save_manifest(root, manifest)
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, manifest = load_manifest(root, args.run)
+    print(f"run: {manifest['run_id']}")
+    print(f"base: {manifest['base_branch']} {manifest['base_sha'][:12]}")
+    print(f"integration: {manifest['integration_branch']}")
+    print(f"tmux: {manifest['tmux_session']}")
+    print()
+    print(f"{'lane':16} {'status':12} {'commits':7} {'dirty':6} {'report':6} worktree")
+    for lane in manifest.get("lanes", []):
+        facts = lane.get("last_collect") or {}
+        commits = str(lane.get("commits_ahead", facts.get("commits_ahead", "?")))
+        dirty = str(lane.get("worktree_dirty", facts.get("worktree_dirty", "?")))
+        report = "yes" if Path(lane["report"]).exists() else "no"
+        print(
+            f"{lane['name'][:16]:16} {lane['status'][:12]:12} {commits:7} {dirty[:6]:6} {report:6} {lane['worktree']}"
+        )
+        if lane.get("model") or lane.get("variant"):
+            print(
+                f"{'':16} {'model':12} {(lane.get('model') or '<agent default>')}"
+                f"{(' / ' + lane.get('variant')) if lane.get('variant') else ''}"
+            )
+        if lane.get("commit_policy"):
+            print(f"{'':16} {'commit':12} {lane.get('commit_policy')}")
+    ver = manifest.get("verification", {})
+    print()
+    print(f"verification: {ver.get('status', 'unknown')} report={ver.get('report')}")
+    return 0
+
+
+def ensure_integration_worktree(root: Path, manifest: dict[str, Any]) -> Path:
+    branch = manifest["integration_branch"]
+    worktree = Path(manifest["integration_worktree"])
+    if not branch_exists(root, branch):
+        git(root, ["branch", branch, manifest["base_sha"]], check=True)
+    if not worktree.exists() and not worktree_registered(root, worktree):
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        git(root, ["worktree", "add", str(worktree), branch], check=True)
+    return worktree
+
+
+def run_gate_commands(worktree: Path, commands: list[str], log_path: Path) -> bool:
+    if not commands:
+        return True
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = True
+    with log_path.open("a", encoding="utf-8") as log:
+        for cmd in commands:
+            log.write(f"\n$ {cmd}\n")
+            proc = subprocess.run(cmd, cwd=str(worktree), shell=True, text=True, stdout=log, stderr=subprocess.STDOUT)
+            log.write(f"[exit {proc.returncode}]\n")
+            if proc.returncode != 0:
+                ok = False
+                break
+    return ok
+
+
+def build_worktree_patch(lane: dict[str, Any]) -> str:
+    wt = Path(lane["worktree"])
+    git(wt, ["add", "-A"], check=True)
+    try:
+        proc = run_cmd(["git", "-C", str(wt), "diff", "--cached", "--binary"], check=True)
+        patch = proc.stdout or ""
+    finally:
+        git(wt, ["reset", "--mixed", "HEAD"], check=True)
+    if not patch.strip():
+        raise AgentRunError(f"lane {lane['name']} has no coordinator-owned patch to integrate")
+    return patch
+
+
+def integrate_coordinator_changes(
+    *,
+    root: Path,
+    manifest: dict[str, Any],
+    lane: dict[str, Any],
+    worktree: Path,
+) -> str:
+    patch_text = build_worktree_patch(lane)
+    patch_dir = run_root(root, manifest["run_id"]) / "integration"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = patch_dir / f"{lane['name']}.patch"
+    patch_path.write_text(patch_text, encoding="utf-8")
+
+    proc = run_cmd(
+        ["git", "-C", str(worktree), "apply", "--index", str(patch_path)],
+        check=False,
+    )
+    if proc.returncode != 0:
+        lane["status"] = "failed"
+        lane["integration_error"] = (proc.stderr or proc.stdout or "").strip()
+        save_manifest(root, manifest)
+        raise AgentRunError(f"patch apply failed for {lane['name']}; resolve in {worktree}")
+
+    lane_gates = lane.get("gates") or []
+    if lane_gates:
+        log_path = patch_dir / f"{lane['name']}-gates.log"
+        if not run_gate_commands(worktree, lane_gates, log_path):
+            lane["status"] = "failed"
+            lane["integration_error"] = f"lane gates failed after applying patch; see {log_path}"
+            save_manifest(root, manifest)
+            raise AgentRunError(lane["integration_error"])
+
+    message = f"feat({lane['name']}): integrate agent lane"
+    commit = run_cmd(
+        ["git", "-C", str(worktree), "commit", "--no-verify", "-m", message],
+        check=False,
+    )
+    if commit.returncode != 0:
+        lane["status"] = "failed"
+        lane["integration_error"] = (commit.stderr or commit.stdout or "").strip()
+        save_manifest(root, manifest)
+        raise AgentRunError(f"coordinator commit failed for {lane['name']}: {lane['integration_error']}")
+    return str(patch_path)
+
+
+def command_integrate(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, manifest = load_manifest(root, args.run)
+    worktree = ensure_integration_worktree(root, manifest)
+    if git(worktree, ["status", "--porcelain"], check=True) and not args.allow_dirty_integration:
+        raise AgentRunError(f"integration worktree is dirty: {worktree}")
+    lanes = selected_lanes(manifest, args.lane)
+    if not lanes:
+        raise AgentRunError("no lanes selected")
+
+    for lane in lanes:
+        if lane["status"] == "integrated" and not args.reintegrate:
+            print(f"skip {lane['name']}: already integrated")
+            continue
+        if lane["status"] != "done" and not args.force:
+            raise AgentRunError(f"lane {lane['name']} is {lane['status']}; run collect or use --force")
+        if not Path(lane["report"]).exists() and not args.force:
+            raise AgentRunError(f"lane {lane['name']} has no report: {lane['report']}")
+        facts = lane_git_facts(root, manifest, lane)
+        commit_policy = lane.get("commit_policy", "coordinator")
+        if facts["commits_ahead"] <= 0 and commit_policy != "coordinator" and not args.force:
+            raise AgentRunError(f"lane {lane['name']} has no commits ahead of base")
+        if facts["commits_ahead"] <= 0 and commit_policy == "coordinator" and not facts["worktree_dirty"] and not args.force:
+            raise AgentRunError(f"lane {lane['name']} has no commit and no dirty coordinator-owned changes")
+        print(
+            f"integrating {lane['name']} "
+            f"({facts['commits_ahead']} commit(s), commit_policy={commit_policy})"
+        )
+        if facts["commits_ahead"] > 0:
+            proc = run_cmd(
+                ["git", "-C", str(worktree), "cherry-pick", f"{manifest['base_sha']}..{lane['branch']}"],
+                check=False,
+            )
+            if proc.returncode != 0:
+                lane["status"] = "failed"
+                lane["integration_error"] = (proc.stderr or proc.stdout or "").strip()
+                save_manifest(root, manifest)
+                raise AgentRunError(f"cherry-pick failed for {lane['name']}; resolve in {worktree}")
+        else:
+            lane["integrated_patch"] = integrate_coordinator_changes(
+                root=root,
+                manifest=manifest,
+                lane=lane,
+                worktree=worktree,
+            )
+            lane["commit_hooks"] = "bypassed_after_lane_gates"
+        lane["status"] = "integrated"
+        lane["integrated_at"] = now()
+        lane["integrated_head"] = git(worktree, ["rev-parse", "HEAD"], check=True)
+        manifest.setdefault("events", []).append({"at": now(), "type": "integrate_lane", "lane": lane["name"]})
+
+    if not args.skip_gates:
+        log_path = run_root(root, manifest["run_id"]) / "integration" / "gates.log"
+        gates_ok = run_gate_commands(worktree, manifest.get("global_gates", []), log_path)
+        manifest["integration_gate"] = {
+            "at": now(),
+            "ok": gates_ok,
+            "log": str(log_path),
+            "commands": manifest.get("global_gates", []),
+        }
+        save_manifest(root, manifest)
+        if not gates_ok:
+            raise AgentRunError(f"integration gate failed; see {log_path}")
+    save_manifest(root, manifest)
+    print(f"integration worktree: {worktree}")
+    print(f"integration branch: {manifest['integration_branch']}")
+    return 0
+
+
+def render_verifier_prompt(manifest: dict[str, Any]) -> str:
+    accepted = [
+        {
+            "lane": lane["name"],
+            "branch": lane["branch"],
+            "commit": lane.get("integrated_head") or lane.get("commit_sha"),
+            "changed_files": lane.get("changed_files", []),
+            "report": lane["report"],
+        }
+        for lane in manifest.get("lanes", [])
+        if lane["status"] == "integrated"
+    ]
+    return f"""# Agent Run Verifier
+
+You are the verifier for an integrated multi-agent run. Do not edit files.
+
+Run:
+- id: {manifest['run_id']}
+- repo: {manifest['repo']}
+- base branch: {manifest['base_branch']}
+- base sha: {manifest['base_sha']}
+- integration branch: {manifest['integration_branch']}
+- integration worktree: {manifest['integration_worktree']}
+
+Accepted lanes:
+```json
+{json.dumps(accepted, indent=2)}
+```
+
+Global gates:
+```json
+{json.dumps(manifest.get('global_gates', []), indent=2)}
+```
+
+Task:
+1. Read the run spec and accepted worker reports.
+2. Infer the integrated behavior claim.
+3. Run command-backed checks from the integration worktree.
+4. Include at least one adversarial/edge probe when practical.
+5. Write `{manifest['verification']['report']}`.
+
+Truth discipline:
+- Do not infer product readiness from artifact presence.
+- A receipt proves only what its schema explicitly states.
+- If evidence is ambiguous, classify it as PARTIAL.
+- Prefer false negatives over false positives.
+- Separate implemented behavior from verified product truth.
+- Do not claim deployed/customer/runtime readiness unless direct evidence proves that exact claim.
+
+Report format:
+VERDICT: PASS | FAIL | PARTIAL
+
+CLAIM:
+- <behavior verified>
+
+CHECKS:
+- name: <check>
+  command: <exact command>
+  observed: <important output/artifact>
+  result: PASS | FAIL
+
+FINDINGS:
+- <blocking issue or None>
+
+SUMMARY:
+- <1-3 bullets>
+
+CLAIMS AUDIT:
+- Claims made:
+- Claims intentionally not made:
+- Evidence for each claim:
+- Ambiguous evidence:
+"""
+
+
+def command_verify(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, manifest = load_manifest(root, args.run)
+    worktree = Path(manifest["integration_worktree"])
+    if not worktree.exists():
+        raise AgentRunError("integration worktree not found; run agent-run integrate first")
+    if not any(lane["status"] == "integrated" for lane in manifest.get("lanes", [])):
+        raise AgentRunError("no integrated lanes to verify")
+    prompt_path = Path(manifest["verification"]["prompt"])
+    prompt_path.write_text(render_verifier_prompt(manifest), encoding="utf-8")
+    report_path = Path(manifest["verification"]["report"])
+    agent = args.agent
+    title = f"agent-run/{manifest['run_id']}/verifier"
+    script = run_root(root, manifest["run_id"]) / "bin" / "launch-verifier.sh"
+    text = f"""#!/usr/bin/env bash
+set -euo pipefail
+OPENCODE_BIN="${{AGENT_RUN_OPENCODE:-opencode}}"
+cd {json.dumps(str(worktree))}
+exec "$OPENCODE_BIN" run \\
+  --agent {json.dumps(agent)} \\
+  --dir {json.dumps(str(worktree))} \\
+  --title {json.dumps(title)} \\
+  --file {json.dumps(str(prompt_path))} \\
+  -- \\
+  "Follow the attached verifier prompt exactly. Do not edit files."
+"""
+    script.write_text(text, encoding="utf-8")
+    script.chmod(0o755)
+    if args.print_command:
+        print(script)
+    elif args.foreground:
+        manifest["verification"]["status"] = "running"
+        save_manifest(root, manifest)
+        proc = subprocess.run([str(script)])
+        manifest["verification"]["status"] = "report_pending" if proc.returncode == 0 else "failed"
+        refresh_verification_status(manifest)
+        save_manifest(root, manifest)
+        return proc.returncode
+    else:
+        session = manifest["tmux_session"]
+        if tmux_has_session(session):
+            run_cmd(["tmux", "new-window", "-t", session, "-n", "verifier", str(script)], capture=True)
+        else:
+            run_cmd(["tmux", "new-session", "-d", "-s", session, "-n", "verifier", str(script)], capture=True)
+        manifest["verification"]["status"] = "running"
+        manifest["verification"]["launched_at"] = now()
+        save_manifest(root, manifest)
+        print(f"launched verifier in tmux session {session}")
+    print(f"verifier prompt: {prompt_path}")
+    print(f"verifier report: {report_path}")
+    return 0
+
+
+def command_cleanup(args: argparse.Namespace) -> int:
+    root = repo_root()
+    _, manifest = load_manifest(root, args.run)
+    removed: list[str] = []
+    would_remove: list[str] = []
+    preserved: list[str] = []
+    for lane in manifest.get("lanes", []):
+        wt = Path(lane["worktree"])
+        if lane["status"] not in {"integrated", "abandoned"}:
+            preserved.append(f"{lane['name']}: status={lane['status']}")
+            continue
+        if not wt.exists():
+            continue
+        dirty = git(wt, ["status", "--porcelain"], check=True)
+        if dirty:
+            preserved.append(f"{lane['name']}: dirty worktree {wt}")
+            continue
+        if args.dry_run:
+            would_remove.append(f"{lane['name']}: {wt}")
+        else:
+            git(root, ["worktree", "remove", str(wt)], check=True)
+            if args.delete_branches and branch_exists(root, lane["branch"]):
+                git(root, ["branch", "-D", lane["branch"]], check=True)
+            removed.append(f"{lane['name']}: {wt}")
+    if args.integration:
+        wt = Path(manifest["integration_worktree"])
+        if wt.exists():
+            dirty = git(wt, ["status", "--porcelain"], check=True)
+            if dirty:
+                preserved.append(f"integration: dirty worktree {wt}")
+            elif args.dry_run:
+                would_remove.append(f"integration: {wt}")
+            else:
+                git(root, ["worktree", "remove", str(wt)], check=True)
+                removed.append(f"integration: {wt}")
+    if args.dry_run:
+        print("would remove:")
+        for item in would_remove:
+            print(f"- {item}")
+    else:
+        print("removed:")
+        for item in removed:
+            print(f"- {item}")
+    print("preserved:")
+    for item in preserved:
+        print(f"- {item}")
+    return 0
+
+
+def command_doctor(_args: argparse.Namespace) -> int:
+    try:
+        root = repo_root()
+        print(f"repo: {root}")
+    except AgentRunError:
+        print("repo: not inside a git repository")
+    for tool in [
+        "git",
+        "tmux",
+        os.environ.get("AGENT_RUN_CLAUDE", "claude"),
+        os.environ.get("AGENT_RUN_OPENCODE", "opencode"),
+    ]:
+        exe = shutil.which(tool)
+        print(f"{tool}: {exe or 'missing'}")
+    if shutil.which("claude"):
+        proc = run_cmd(["claude", "--version"], check=False)
+        version = (proc.stdout or proc.stderr or "").strip()
+        print(f"claude version: {version or 'unknown'}")
+    if shutil.which("opencode"):
+        proc = run_cmd(["opencode", "--version"], check=False)
+        version = (proc.stdout or proc.stderr or "").strip()
+        print(f"opencode version: {version or 'unknown'}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-run",
+        description="Run one durable implementation task for Codex to review, verify, and commit.",
+    )
+    parser.add_argument("--run", help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{start,status,wait,result,tail,continue,stop,doctor}",
+    )
+
+    def add_run_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--run",
+            dest="run",
+            default=argparse.SUPPRESS,
+            help="run id; accepted here for convenience as well as before the subcommand",
+        )
+
+    p = sub.add_parser("start", help="start one background implementation task")
+    p.add_argument("name")
+    p.add_argument("--objective", required=True)
+    p.add_argument("--spec", help="repo-relative or absolute implementation spec file")
+    p.add_argument("--own", action="append", help="worker-owned file or directory; repeatable")
+    p.add_argument("--avoid", action="append", help="path or area the worker must avoid; repeatable")
+    p.add_argument("--non-goal", action="append", help="explicit exclusion; repeatable")
+    p.add_argument("--gate", action="append", help="worker verification command; repeatable")
+    p.add_argument(
+        "--backend",
+        choices=["claude", "opencode"],
+        default=os.environ.get("AGENT_RUN_BACKEND", "opencode"),
+        help="worker backend; defaults to opencode",
+    )
+    p.add_argument(
+        "--agent",
+        default=os.environ.get("AGENT_RUN_WORKER_AGENT"),
+    )
+    p.add_argument("--model", help="optional worker model override")
+    p.add_argument("--variant", help="optional worker effort/variant override")
+    p.add_argument("--base-ref", default="HEAD", help=argparse.SUPPRESS)
+    p.add_argument("--claims-audit", action="store_true", help="require claims/non-claims evidence")
+    p.add_argument("--allow-broad-scope", action="store_true")
+    p.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=command_task_start)
+
+    p = sub.add_parser("wait", help="wait for a background task to finish")
+    p.add_argument("task", nargs="?")
+    p.add_argument("--timeout", type=float, default=0, help="seconds; 0 waits indefinitely")
+    p.add_argument("--interval", type=float, default=1.0)
+    p.add_argument("--heartbeat", type=float, default=0.0, help="seconds between progress lines; 0 disables")
+    p.set_defaults(func=command_task_wait)
+
+    p = sub.add_parser("result", help="print the task's compact worker result")
+    p.add_argument("task", nargs="?")
+    p.set_defaults(func=command_task_result)
+
+    p = sub.add_parser("tail", help="print or follow the active task log")
+    p.add_argument("task", nargs="?")
+    p.add_argument("-n", "--lines", type=int, default=80)
+    p.add_argument("-f", "--follow", action="store_true")
+    p.set_defaults(func=command_task_tail)
+
+    p = sub.add_parser("continue", help="continue the exact worker session with a correction")
+    p.add_argument("task", nargs="?")
+    correction = p.add_mutually_exclusive_group(required=True)
+    correction.add_argument("--message")
+    correction.add_argument("--message-file")
+    p.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=command_task_continue)
+
+    p = sub.add_parser("stop", help="stop a running background task")
+    p.add_argument("task", nargs="?")
+    p.add_argument("--reason", help="record why the task was stopped")
+    p.set_defaults(func=command_task_stop)
+
+    p = sub.add_parser("init", help=argparse.SUPPRESS)
+    p.add_argument("name")
+    p.add_argument("--run-id")
+    p.add_argument("--goal")
+    p.add_argument("--goal-file")
+    p.add_argument("--gate", action="append", help="global gate command; repeatable")
+    p.add_argument("--base-ref", default="HEAD")
+    p.add_argument("--allow-dirty", action="store_true")
+    p.add_argument("--reuse", action="store_true")
+    p.set_defaults(func=command_init)
+
+    p = sub.add_parser("prompt", help=argparse.SUPPRESS)
+    p.add_argument("lane")
+    p.add_argument("--objective", required=True)
+    p.add_argument("--goal")
+    p.add_argument("--goal-file")
+    p.add_argument("--own", action="append", help="path/area owned by this prompt; repeatable")
+    p.add_argument("--avoid", action="append", help="path/area to avoid; repeatable")
+    p.add_argument("--non-goal", action="append", help="explicit exclusion; repeatable")
+    p.add_argument("--gate", action="append", help="gate command; repeatable")
+    p.add_argument("--agent", default=os.environ.get("AGENT_RUN_OPENCODE_AGENT", "build"))
+    p.add_argument("--model", help="optional worker model override, e.g. opencode-go/deepseek-v4-pro")
+    p.add_argument("--variant", help="optional worker model variant/reasoning override, e.g. high")
+    p.add_argument("--base-ref", default="HEAD")
+    p.add_argument("--output", help="write prompt to this path instead of .codex/prompts/agent-run")
+    p.add_argument("--stdout", action="store_true", help="also print the prompt body")
+    p.add_argument("--allow-broad-scope", action="store_true")
+    p.set_defaults(func=command_prompt)
+
+    p = sub.add_parser("add", help=argparse.SUPPRESS)
+    add_run_arg(p)
+    p.add_argument("lane")
+    p.add_argument("--objective", required=True)
+    p.add_argument("--spec")
+    p.add_argument("--own", action="append", help="path/area owned by this lane; repeatable")
+    p.add_argument("--avoid", action="append", help="path/area to avoid; repeatable")
+    p.add_argument("--non-goal", action="append", help="explicit exclusion; repeatable")
+    p.add_argument("--gate", action="append", help="lane gate command; repeatable")
+    p.add_argument("--agent", default=os.environ.get("AGENT_RUN_OPENCODE_AGENT", "build"))
+    p.add_argument("--model", help="optional OpenCode model override for this lane, e.g. openai/gpt-5.5")
+    p.add_argument("--variant", help="optional OpenCode model variant/reasoning override, e.g. high")
+    p.add_argument(
+        "--commit-policy",
+        choices=["coordinator", "worker"],
+        default=os.environ.get("AGENT_RUN_COMMIT_POLICY", "coordinator"),
+        help="who owns the lane commit; default coordinator leaves worker changes uncommitted for Codex review",
+    )
+    p.add_argument("--reuse", action="store_true")
+    p.add_argument("--allow-overlap", action="store_true")
+    p.add_argument("--allow-broad-scope", action="store_true")
+    p.add_argument(
+        "--allow-dirty-base",
+        action="store_true",
+        help="allow adding a writable lane to a run initialized from tracked dirty files",
+    )
+    p.set_defaults(func=command_add)
+
+    p = sub.add_parser("launch", help=argparse.SUPPRESS)
+    add_run_arg(p)
+    p.add_argument("--lane", action="append")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--foreground", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=command_launch)
+
+    p = sub.add_parser("collect", help=argparse.SUPPRESS)
+    add_run_arg(p)
+    p.add_argument("--lane", action="append")
+    p.set_defaults(func=command_collect)
+
+    p = sub.add_parser("status", help="show the current task status")
+    add_run_arg(p)
+    p.add_argument("task", nargs="?")
+    p.add_argument("--watch", action="store_true", help="refresh status until the task exits")
+    p.add_argument("--interval", type=float, default=5.0)
+    p.set_defaults(func=command_status_dispatch)
+
+    p = sub.add_parser("integrate", help=argparse.SUPPRESS)
+    add_run_arg(p)
+    p.add_argument("--lane", action="append")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--reintegrate", action="store_true")
+    p.add_argument("--skip-gates", action="store_true")
+    p.add_argument("--allow-dirty-integration", action="store_true")
+    p.set_defaults(func=command_integrate)
+
+    p = sub.add_parser("verify", help=argparse.SUPPRESS)
+    add_run_arg(p)
+    p.add_argument("--agent", default="verifier")
+    p.add_argument("--foreground", action="store_true")
+    p.add_argument("--print-command", action="store_true")
+    p.set_defaults(func=command_verify)
+
+    p = sub.add_parser("cleanup", help=argparse.SUPPRESS)
+    add_run_arg(p)
+    p.add_argument("--delete-branches", action="store_true")
+    p.add_argument("--integration", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=command_cleanup)
+
+    p = sub.add_parser("doctor", help="check git/tmux/worker availability")
+    p.set_defaults(func=command_doctor)
+    visible_commands = {"start", "status", "wait", "result", "continue", "stop", "doctor"}
+    sub._choices_actions[:] = [
+        action for action in sub._choices_actions if action.dest in visible_commands
+    ]
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args) or 0)
+    except AgentRunError as exc:
+        print(f"agent-run: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

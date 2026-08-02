@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_DIR="."
+
+if [[ "${1:-}" == "-C" || "${1:-}" == "--dir" ]]; then
+  TARGET_DIR="${2:-}"
+  shift 2
+fi
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: oc-night [-C <repo>] <prompt-or-/command ...>" >&2
+  exit 2
+fi
+
+TASK_ARGS=("$@")
+
+TITLE=${OC_NIGHT_TITLE:-"night-$(date +%Y%m%d-%H%M)"}
+LOGDIR_REL=${OC_LOGDIR:-"docs/sessions"}
+
+mkdir -p "$TARGET_DIR/$LOGDIR_REL"
+LOGFILE="$TARGET_DIR/$LOGDIR_REL/${TITLE}.log"
+EXPORTFILE="$TARGET_DIR/$LOGDIR_REL/${TITLE}.json"
+LATEST_TXT="$TARGET_DIR/$LOGDIR_REL/latest.txt"
+
+/home/elwalid/bin/oc-availability night "${OC_AWAY_REASON:-night}" >/dev/null || true
+
+(
+  cd "$TARGET_DIR"
+  export OPENCODE_CONFIG="/home/elwalid/.config/opencode/opencode.away.json"
+
+  if [[ "${TASK_ARGS[0]}" == /* ]]; then
+    CMD_NAME="${TASK_ARGS[0]#/}"
+    opencode run \
+      --agent build \
+      --title "$TITLE" \
+      --print-logs \
+      --command "$CMD_NAME" \
+      "${TASK_ARGS[@]:1}" 2>&1 | tee "$LOGFILE" || true
+  else
+    opencode run \
+      --agent build \
+      --title "$TITLE" \
+      --print-logs \
+      "${TASK_ARGS[@]}" 2>&1 | tee "$LOGFILE" || true
+  fi
+)
+
+LATEST_ID=$(cd "$TARGET_DIR" && opencode session list -n 1 --format json 2>/dev/null | jq -r '.[0].id' 2>/dev/null || true)
+if [[ -n "$LATEST_ID" && "$LATEST_ID" != "null" ]]; then
+  (cd "$TARGET_DIR" && opencode export "$LATEST_ID" > "$EXPORTFILE" 2>/dev/null) || true
+  printf "%s" "$LATEST_ID" > "$LATEST_TXT" 2>/dev/null || true
+  echo "Export: $EXPORTFILE"
+fi
+
+echo "Log: $LOGFILE"

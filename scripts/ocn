@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# ocn - OpenCode with local Nemotron-9B-OpenCode, started on demand.
+
+set -euo pipefail
+
+ROOT="${ASAYL_LLM_ROOT:-$HOME/asayl-local-llm}"
+LLAMA_PORT="${OCN_LLAMA_PORT:-18083}"
+PORT="${OCN_PORT:-18084}"
+BASE_URL="${OCN_BASE_URL:-http://127.0.0.1:$PORT/v1}"
+MODEL_ID="${OCN_MODEL:-llama.nemotron/nemotron-9b-opencode}"
+AGENT_ID="${OCN_AGENT:-local-nemotron}"
+WAIT_TIMEOUT="${OCN_WAIT_TIMEOUT:-75}"
+CTX="${OCN_CTX:-}"
+NGL="${OCN_NGL:-99}"
+THREADS="${OCN_THREADS:-10}"
+TEMP="${OCN_TEMP:-0.2}"
+STOP_AFTER="${OCN_STOP_AFTER:-1}"
+STARTED_BY_OCN=0
+
+usage() {
+  cat <<EOF
+ocn - start local Nemotron-9B-OpenCode and open OpenCode with it selected
+
+Usage:
+  ocn [project-or-opencode-args...]
+  ocn ask "quick local Nemotron question"
+  ocn run "prompt"
+  ocn --status
+  ocn --stop
+  ocn --keep-server [args...]
+
+Defaults:
+  model:     $MODEL_ID
+  agent:     $AGENT_ID
+  endpoint:  $BASE_URL
+  context:   ask uses 8192 by default; full OpenCode uses 32768
+
+Startup time:
+  Expected ~6-18s once downloaded; up to ~30s cold cache.
+
+Images:
+  Not enabled here. The repo has mmproj files, but this command is text/code
+  only so OpenCode and quick questions stay simple and light.
+EOF
+}
+
+api_ready() {
+  curl -fsS --max-time 2 "$BASE_URL/models" >/dev/null 2>&1
+}
+
+llama_ready() {
+  curl -fsS --max-time 2 "http://127.0.0.1:$LLAMA_PORT/v1/models" >/dev/null 2>&1
+}
+
+status() {
+  if api_ready; then
+    echo "Nemotron OpenCode proxy: ready at $BASE_URL"
+  else
+    echo "Nemotron OpenCode proxy: not ready at $BASE_URL"
+  fi
+  if llama_ready; then
+    echo "llama.cpp upstream: ready at http://127.0.0.1:$LLAMA_PORT/v1"
+  else
+    echo "llama.cpp upstream: not ready at http://127.0.0.1:$LLAMA_PORT/v1"
+  fi
+
+  local pid_file="$ROOT/logs/llama-server-$LLAMA_PORT.pid"
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid="$(<"$pid_file")"
+    ps -p "$pid" -o pid,stat,pcpu,pmem,rss,etime,comm,args 2>/dev/null || true
+  fi
+  local proxy_pid_file="$ROOT/logs/llama-tool-proxy-$PORT.pid"
+  if [[ -f "$proxy_pid_file" ]]; then
+    local proxy_pid
+    proxy_pid="$(<"$proxy_pid_file")"
+    ps -p "$proxy_pid" -o pid,stat,pcpu,pmem,rss,etime,comm,args 2>/dev/null || true
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits || true
+  fi
+}
+
+stop_server() {
+  local proxy_pid_file="$ROOT/logs/llama-tool-proxy-$PORT.pid"
+  if [[ -f "$proxy_pid_file" ]]; then
+    local proxy_pid
+    proxy_pid="$(<"$proxy_pid_file")"
+    if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
+      kill "$proxy_pid" 2>/dev/null || true
+    fi
+    rm -f "$proxy_pid_file"
+  fi
+  PORT="$LLAMA_PORT" bash "$ROOT/scripts/stop-llm.sh"
+  tmux kill-session -t "asayl-llm-$LLAMA_PORT" 2>/dev/null || true
+}
+
+start_proxy() {
+  if api_ready; then
+    return 0
+  fi
+
+  local proxy_pid_file="$ROOT/logs/llama-tool-proxy-$PORT.pid"
+  local proxy_log="$ROOT/logs/nemotron-tool-proxy.log"
+  if [[ -f "$proxy_pid_file" ]]; then
+    local old_pid
+    old_pid="$(<"$proxy_pid_file")"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null || true
+    fi
+    rm -f "$proxy_pid_file"
+  fi
+
+  echo "Starting Nemotron OpenCode tool-call proxy on 127.0.0.1:$PORT." >&2
+  LLAMA_PROXY_UPSTREAM="http://127.0.0.1:$LLAMA_PORT" \
+    LLAMA_PROXY_HOST="127.0.0.1" \
+    LLAMA_PROXY_PORT="$PORT" \
+    nohup python3 "$ROOT/scripts/llama_tool_stream_proxy.py" >>"$proxy_log" 2>&1 &
+  printf '%s\n' "$!" >"$proxy_pid_file"
+}
+
+start_server() {
+  if api_ready && llama_ready; then
+    return 0
+  fi
+
+  echo "Starting local Nemotron-9B-OpenCode. Expected wait: 6-18s, up to ~30s cold cache." >&2
+  if ! llama_ready; then
+    LLAMA_BIN="${LLAMA_BIN:-/run/current-system/sw/bin/llama-server}" \
+      PORT="$LLAMA_PORT" CTX="$CTX" NGL="$NGL" THREADS="$THREADS" TEMP="$TEMP" \
+      MAX_CPU_C="${MAX_CPU_C:-85}" MAX_GPU_C="${MAX_GPU_C:-78}" \
+      bash "$ROOT/scripts/run-nemotron-9b-opencode.sh" >&2
+  fi
+  start_proxy
+
+  STARTED_BY_OCN=1
+
+  local i
+  for ((i = 1; i <= WAIT_TIMEOUT; i++)); do
+    if api_ready; then
+      echo "Local Nemotron is ready for OpenCode at $BASE_URL" >&2
+      return 0
+    fi
+    if (( i % 5 == 0 )); then
+      echo "Waiting for local Nemotron... ${i}s" >&2
+    fi
+    sleep 1
+  done
+
+  echo "Timed out waiting for local Nemotron at $BASE_URL" >&2
+  echo "Recent server log:" >&2
+  tail -80 "$ROOT/logs/nemotron-9b-opencode.log" >&2 2>/dev/null || true
+  return 1
+}
+
+ask_nemotron() {
+  local prompt="$*"
+  if [[ -z "$prompt" && ! -t 0 ]]; then
+    prompt="$(cat)"
+  fi
+  if [[ -z "$prompt" ]]; then
+    echo "ocn ask needs a prompt or stdin." >&2
+    return 2
+  fi
+
+  local max_tokens="${OCN_ASK_MAX_TOKENS:-1024}"
+  local payload
+  payload="$(
+    jq -n \
+      --arg prompt "$prompt" \
+      --argjson max_tokens "$max_tokens" \
+      '{
+        model: "local",
+        messages: [
+          {role: "system", content: "You are a concise local coding agent. Answer directly."},
+          {role: "user", content: $prompt}
+        ],
+        temperature: 0.2,
+        max_tokens: $max_tokens
+      }'
+  )"
+
+  curl -fsS "$BASE_URL/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload" |
+    jq -r '.choices[0].message.content'
+}
+
+open_opencode() {
+  export GEMINI_API_KEY=
+  export OPENCODE_EXPERIMENTAL=1
+
+  if [[ $# -gt 0 && "$1" == "run" ]]; then
+    shift
+    echo "Opening OpenCode run with local Nemotron. Nemotron will stop when this command exits if ocn started it." >&2
+    oc run --agent "$AGENT_ID" "$@"
+    return $?
+  fi
+
+  echo "Opening OpenCode with local Nemotron. Nemotron will stop when OpenCode exits if ocn started it." >&2
+  echo "Use 'ocn --stop' from another terminal if you want the GPU back immediately." >&2
+  oc --agent "$AGENT_ID" "$@"
+}
+
+main() {
+  local args=()
+  local ask_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --status)
+        status
+        return 0
+        ;;
+      --stop)
+        stop_server
+        return 0
+        ;;
+      --keep-server|--no-stop)
+        STOP_AFTER=0
+        shift
+        ;;
+      ask)
+        ask_mode=1
+        shift
+        args+=("$@")
+        break
+        ;;
+      --)
+        shift
+        args+=("$@")
+        break
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$CTX" ]]; then
+    if [[ "$ask_mode" == "1" ]]; then
+      CTX=8192
+    else
+      CTX=32768
+    fi
+  fi
+
+  start_server
+
+  if [[ "$STOP_AFTER" == "1" && "$STARTED_BY_OCN" == "1" ]]; then
+    trap 'stop_server >/dev/null 2>&1 || true' EXIT INT TERM
+  fi
+
+  if [[ "$ask_mode" == "1" ]]; then
+    ask_nemotron "${args[@]}"
+    return $?
+  fi
+
+  open_opencode "${args[@]}"
+}
+
+main "$@"

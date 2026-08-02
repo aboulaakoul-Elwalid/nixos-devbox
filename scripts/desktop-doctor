@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local/state/desktop-doctor"
+LATEST = STATE_DIR / "latest.json"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def run(cmd, timeout=3):
+    start = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        return {
+            "ok": proc.returncode == 0,
+            "code": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+            "latency_ms": int((time.monotonic() - start) * 1000),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "code": 124,
+            "stdout": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
+            "stderr": "timeout",
+            "latency_ms": int((time.monotonic() - start) * 1000),
+        }
+    except FileNotFoundError:
+        return {"ok": False, "code": 127, "stdout": "", "stderr": "missing command", "latency_ms": 0}
+
+
+def check(name, status, summary, latency_ms=0, details=None):
+    return {
+        "name": name,
+        "status": status,
+        "latency_ms": latency_ms,
+        "summary": summary,
+        "details": details or {},
+    }
+
+
+def service_state(unit):
+    res = run(["systemctl", "--user", "is-active", unit], timeout=2)
+    state = res["stdout"] or "unknown"
+    if state == "active":
+        return check(f"service:{unit}", "ok", "active", res["latency_ms"], {"state": state})
+    if state in {"inactive", "deactivating"}:
+        return check(f"service:{unit}", "warn", state, res["latency_ms"], {"state": state})
+    return check(f"service:{unit}", "fail", state, res["latency_ms"], {"state": state, "stderr": res["stderr"]})
+
+
+def disk_pct(path):
+    try:
+        usage = shutil.disk_usage(path)
+        return round((usage.used / usage.total) * 100, 1), usage.free // (1024 ** 3)
+    except Exception:
+        return None, None
+
+
+def latest_mtime_age(path):
+    try:
+        return int(time.time() - Path(path).stat().st_mtime)
+    except Exception:
+        return None
+
+
+XID_RE = re.compile(r"Xid[^:]*:\s*(\d+)")
+
+
+def gpu_xid_events(window_min):
+    res = run(["journalctl", "-k", "-o", "cat", f"--since=-{window_min}min"], timeout=4)
+    if not res["ok"] and res["stderr"]:
+        return None
+    lines = [line for line in res["stdout"].splitlines() if "Xid" in line]
+    return lines
+
+
+def collect():
+    checks = []
+    metrics = {"host": socket.gethostname(), "ts": now_iso()}
+
+    failed = run(["systemctl", "--user", "--failed", "--no-legend", "--plain"], timeout=4)
+    failed_lines = [line for line in failed["stdout"].splitlines() if line.strip()]
+    checks.append(check("systemd:user_failed", "ok" if not failed_lines else "fail", f"{len(failed_lines)} failed units", failed["latency_ms"], {"units": failed_lines[:20]}))
+
+    active_bad = run(["systemctl", "--user", "list-units", "--state=activating,failed", "--no-legend", "--plain"], timeout=4)
+    bad_lines = [line for line in active_bad["stdout"].splitlines() if line.strip()]
+    ignored_prefixes = ("opencode-", "desktop-doctor.service", "dailylog-snap.service")
+    ignored = [line for line in bad_lines if line.startswith(ignored_prefixes)]
+    actionable = [line for line in bad_lines if not line.startswith(ignored_prefixes)]
+    checks.append(check("systemd:user_transient", "ok" if not actionable else "warn", f"{len(actionable)} actionable transient units", active_bad["latency_ms"], {"actionable": actionable[:20], "ignored_context": ignored[:20]}))
+
+    for unit in [
+        "omarchy-waybar.service",
+        "aw-server.service",
+        "aw-awatcher.service",
+        "aw-watchdog.service",
+        "pipewire.service",
+        "wireplumber.service",
+        "hyprshell.service",
+        "ai-credits.service",
+    ]:
+        checks.append(service_state(unit))
+
+    hypr = run(["hyprctl", "monitors", "-j"], timeout=3)
+    if hypr["ok"]:
+        try:
+            monitors = json.loads(hypr["stdout"])
+            metrics["hyprland_monitors"] = len(monitors)
+            checks.append(check("hyprland", "ok", f"{len(monitors)} monitors", hypr["latency_ms"]))
+        except Exception:
+            checks.append(check("hyprland", "warn", "invalid monitor JSON", hypr["latency_ms"]))
+    else:
+        checks.append(check("hyprland", "fail", hypr["stderr"] or "hyprctl failed", hypr["latency_ms"]))
+
+    clients = run(["hyprctl", "clients", "-j"], timeout=3)
+    if clients["ok"]:
+        try:
+            metrics["hyprland_clients"] = len(json.loads(clients["stdout"]))
+        except Exception:
+            pass
+
+    aw_info = run(["curl", "-fsS", "http://localhost:5600/api/0/info"], timeout=3)
+    checks.append(check("activitywatch:api", "ok" if aw_info["ok"] else "fail", "api reachable" if aw_info["ok"] else "api unreachable", aw_info["latency_ms"]))
+
+    aw_event = run(["curl", "-fsS", "--get", "http://localhost:5600/api/0/buckets/aw-watcher-window_nixos/events", "--data-urlencode", "limit=1"], timeout=4)
+    if aw_event["ok"]:
+        try:
+            events = json.loads(aw_event["stdout"])
+            latest = events[0]["timestamp"] if events else None
+            metrics["activitywatch_latest_window_ts"] = latest
+            checks.append(check("activitywatch:window_events", "ok" if latest else "warn", "latest event present" if latest else "no recent event", aw_event["latency_ms"], {"latest": latest}))
+        except Exception:
+            checks.append(check("activitywatch:window_events", "warn", "invalid event JSON", aw_event["latency_ms"]))
+
+    for label, path in {
+        "root": "/",
+        "home": str(HOME),
+        "hdd": "/mnt/hdd",
+        "daily_logs": str(HOME / "Videos/daily-logs"),
+        "daily_logs_archive": "/mnt/hdd/daily-logs",
+    }.items():
+        pct, free_gb = disk_pct(path)
+        metrics[f"disk_{label}_pct"] = pct
+        metrics[f"disk_{label}_free_gb"] = free_gb
+        if pct is None:
+            checks.append(check(f"disk:{label}", "warn", f"unavailable: {path}"))
+        else:
+            status = "fail" if free_gb is not None and free_gb < 5 else "warn" if pct > 90 else "ok"
+            checks.append(check(f"disk:{label}", status, f"{pct}% used, {free_gb}G free", details={"path": path}))
+
+    mem = run(["free", "-b"], timeout=2)
+    if mem["ok"]:
+        lines = mem["stdout"].splitlines()
+        if len(lines) > 1:
+            parts = lines[1].split()
+            if len(parts) >= 3:
+                total = int(parts[1])
+                used = int(parts[2])
+                metrics["ram_pct"] = round((used / total) * 100, 1)
+
+    load = os.getloadavg()
+    metrics["load1"] = round(load[0], 2)
+    metrics["load5"] = round(load[1], 2)
+    metrics["load15"] = round(load[2], 2)
+
+    if shutil.which("nvidia-smi"):
+        gpu = run(["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], timeout=3)
+        if gpu["ok"] and gpu["stdout"]:
+            vals = [v.strip() for v in gpu["stdout"].splitlines()[0].split(",")]
+            if len(vals) >= 4:
+                metrics["gpu_temp_c"] = int(vals[0])
+                metrics["gpu_util_pct"] = int(vals[1])
+                metrics["gpu_mem_used_mb"] = int(vals[2])
+                metrics["gpu_mem_total_mb"] = int(vals[3])
+                checks.append(check("gpu:nvidia", "ok", f"{vals[1]}% util, {vals[0]}C", gpu["latency_ms"]))
+
+    xid_window_min = 6
+    xid_lines = gpu_xid_events(xid_window_min)
+    if xid_lines is None:
+        checks.append(check("gpu:xid", "warn", "journalctl unavailable"))
+    else:
+        metrics["gpu_xid_count_recent"] = len(xid_lines)
+        if not xid_lines:
+            checks.append(check("gpu:xid", "ok", f"no Xid errors in last {xid_window_min}min"))
+        else:
+            codes = sorted({m.group(1) for line in xid_lines if (m := XID_RE.search(line))})
+            escalate = len(xid_lines) >= 3 or "56" in codes
+            status = "fail" if escalate else "warn"
+            summary = f"{len(xid_lines)} Xid error(s) in last {xid_window_min}min, codes {','.join(codes) or '?'}"
+            checks.append(check("gpu:xid", status, summary, details={"lines": xid_lines[-10:]}))
+            if escalate:
+                run([
+                    "notify-send",
+                    "-u", "critical",
+                    "GPU driver fault detected",
+                    f"{len(xid_lines)} Xid errors (codes {','.join(codes)}) in the last {xid_window_min}min. "
+                    "Restart Brave now — this pattern preceded the last hard freeze.",
+                ], timeout=2)
+
+    token_cache = HOME / ".cache/waybar/tokens-today.json"
+    metrics["tokens_cache_age_s"] = latest_mtime_age(token_cache)
+    if token_cache.exists():
+        age = metrics["tokens_cache_age_s"]
+        checks.append(check("waybar:tokens_cache", "ok" if age is not None and age < 7200 else "warn", f"age {age}s"))
+    else:
+        checks.append(check("waybar:tokens_cache", "warn", "missing"))
+
+    snap_timer = run(["systemctl", "--user", "is-active", "dailylog-snap.timer"], timeout=2)
+    checks.append(check("dailylog:snap_timer", "ok" if snap_timer["ok"] else "warn", snap_timer["stdout"] or snap_timer["stderr"], snap_timer["latency_ms"]))
+
+    today = datetime.now().strftime("%F")
+    today_dir = HOME / "Videos/daily-logs" / today
+    timeline_age = latest_mtime_age(today_dir / "timeline.jsonl")
+    metrics["dailylog_timeline_age_s"] = timeline_age
+    checks.append(check("dailylog:timeline", "ok" if timeline_age is not None and timeline_age < 900 else "warn", f"age {timeline_age}s" if timeline_age is not None else "missing"))
+
+    if Path("/home/elwalid/.local/bin/awatcher-wayland").exists() and not Path("/run/current-system/sw/bin/awatcher").exists():
+        checks.append(check("activitywatch:awatcher_binary", "warn", "using wrapper store fallback until NixOS rebuild"))
+
+    statuses = [c["status"] for c in checks]
+    overall = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "ok"
+    doc = {"ts": now_iso(), "overall": overall, "checks": checks, "metrics": metrics}
+    return doc
+
+
+def print_human(doc, brief=False):
+    print(f"desktop-doctor: {doc['overall'].upper()} ({doc['ts']})")
+    interesting = [c for c in doc["checks"] if c["status"] != "ok"]
+    if brief:
+        for c in interesting[:5]:
+            print(f"{c['status'].upper()} {c['name']}: {c['summary']}")
+        return
+    for c in doc["checks"]:
+        print(f"{c['status'].upper():4} {c['name']}: {c['summary']}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true", help="print JSON")
+    parser.add_argument("--brief", action="store_true", help="print only non-ok checks")
+    parser.add_argument("--no-write", action="store_true", help="do not update latest.json")
+    args = parser.parse_args()
+
+    doc = collect()
+    if not args.no_write:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LATEST.with_suffix(".tmp")
+        tmp.write_text(json.dumps(doc, indent=2) + "\n")
+        tmp.replace(LATEST)
+
+    if args.json:
+        print(json.dumps(doc, indent=2))
+    else:
+        print_human(doc, brief=args.brief)
+
+    return 0 if doc["overall"] in {"ok", "warn"} else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

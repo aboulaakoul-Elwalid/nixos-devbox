@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# oc-test - Smoke tests for OpenCode customizations after updates
+# Usage: oc-test
+
+set -uo pipefail
+
+PASS=0
+FAIL=0
+STATE_FILE="$HOME/.local/state/opencode/availability.json"
+
+print_result() {
+  local name="$1"
+  local status="$2"
+  if [[ "$status" == "PASS" ]]; then
+    echo "[PASS] $name"
+    ((PASS++))
+  else
+    echo "[FAIL] $name"
+    ((FAIL++))
+  fi
+}
+
+echo "OpenCode Smoke Tests"
+echo "===================="
+echo ""
+
+# Test 1: Basic functionality
+echo "Running: opencode run 'Say OK'"
+if timeout 30 opencode run "Say OK" >/dev/null 2>&1; then
+  print_result "Basic functionality (opencode run)" "PASS"
+else
+  print_result "Basic functionality (opencode run)" "FAIL"
+fi
+
+# Test 2: Away command
+echo "Running: opencode run --command away 'test'"
+if timeout 30 opencode run --command away "test" >/dev/null 2>&1; then
+  print_result "Away command works" "PASS"
+else
+  print_result "Away command works" "FAIL"
+fi
+
+# Test 3: Back command
+echo "Running: opencode run --command back"
+if timeout 30 opencode run --command back >/dev/null 2>&1; then
+  print_result "Back command works" "PASS"
+else
+  print_result "Back command works" "FAIL"
+fi
+
+# Test 4: State file exists
+if [[ -f "$STATE_FILE" ]]; then
+  print_result "State file exists" "PASS"
+else
+  print_result "State file exists" "FAIL"
+fi
+
+# Test 5: State file is valid JSON
+if [[ -f "$STATE_FILE" ]]; then
+  if jq empty "$STATE_FILE" 2>/dev/null; then
+    print_result "State file is valid JSON" "PASS"
+  else
+    print_result "State file is valid JSON" "FAIL"
+  fi
+else
+  print_result "State file is valid JSON (skipped - no file)" "FAIL"
+fi
+
+# Test 6: Plugin syntax check
+PLUGIN_FILE="$HOME/.config/opencode/plugin/availability-mode.js"
+if [[ -f "$PLUGIN_FILE" ]]; then
+  if node -c "$PLUGIN_FILE" 2>/dev/null; then
+    print_result "Plugin syntax valid" "PASS"
+  else
+    print_result "Plugin syntax valid" "FAIL"
+  fi
+else
+  print_result "Plugin syntax valid (no plugin file)" "FAIL"
+fi
+
+echo ""
+echo "===================="
+echo "Results: $PASS passed, $FAIL failed"
+
+if [[ $FAIL -gt 0 ]]; then
+  echo ""
+  echo "Some tests failed. Consider:"
+  echo "  1. Restoring from backup: ls ~/.config/opencode.backup-*"
+  echo "  2. Checking OpenCode version compatibility"
+  exit 1
+fi
+
+exit 0

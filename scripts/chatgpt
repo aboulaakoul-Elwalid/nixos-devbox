@@ -1,0 +1,72 @@
+#!/usr/bin/env -S uvx --from browser-use[cli] python3
+"""
+chatgpt <prompt>  — send a prompt to ChatGPT via your Chrome session and print the response.
+Uses Google Chrome with your Default profile (already logged in).
+"""
+import asyncio, os, shutil, sys, tempfile
+
+CHROME = "/run/current-system/sw/bin/google-chrome"
+PROFILE_SRC = os.path.expanduser("~/.config/google-chrome")
+
+async def ask(prompt: str) -> str:
+    from browser_use import Agent, BrowserSession, BrowserProfile, ChatAnthropic
+
+    # Copy profile to temp dir so we don't conflict with a running Chrome
+    tmp_profile = tempfile.mkdtemp(prefix="chatgpt-bu-")
+    try:
+        # Copy only the Default profile (fast) — Chrome decrypts its own cookies
+        default_src = os.path.join(PROFILE_SRC, "Default")
+        default_dst = os.path.join(tmp_profile, "Default")
+        shutil.copytree(default_src, default_dst, symlinks=True,
+                        ignore=shutil.ignore_patterns(
+                            "Cache", "Code Cache", "GPUCache", "ShaderCache",
+                            "Service Worker", "CacheStorage", "*.log",
+                        ))
+        # Also copy top-level files Chrome needs
+        for f in ("Local State",):
+            src = os.path.join(PROFILE_SRC, f)
+            if os.path.exists(src):
+                shutil.copy2(src, tmp_profile)
+
+        profile = BrowserProfile(
+            executable_path=CHROME,
+            user_data_dir=tmp_profile,
+            headless=False,          # Chrome cookie decryption needs a display / keyring
+            args=["--no-first-run", "--no-default-browser-check",
+                  "--disable-sync", "--disable-background-networking"],
+        )
+        session = BrowserSession(browser_profile=profile)
+
+        llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
+
+        agent = Agent(
+            task=(
+                f"Go to https://chatgpt.com. Start a new chat (click 'New chat' if needed). "
+                f"In the message box, type exactly this prompt and send it:\n\n{prompt}\n\n"
+                f"Wait until the response is fully generated (the stop button disappears). "
+                f"Then return ONLY the full text of ChatGPT's response, nothing else."
+            ),
+            llm=llm,
+            browser_session=session,
+        )
+
+        result = await agent.run(max_steps=20)
+        return result.final_result() or "(no response extracted)"
+
+    finally:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: chatgpt <prompt>", file=sys.stderr)
+        print('       chatgpt "explain unified namespace in one paragraph"', file=sys.stderr)
+        sys.exit(1)
+
+    prompt = " ".join(sys.argv[1:])
+    response = asyncio.run(ask(prompt))
+    print(response)
+
+
+if __name__ == "__main__":
+    main()

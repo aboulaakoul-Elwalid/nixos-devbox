@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Sync WALID/OpenCode config into Construct persistent home.
+# This lets `oc-walk --sandbox construct` and `oc-night --sandbox construct`
+# run OpenCode inside Construct while keeping your normal configs/plugins.
+
+SRC_HOME="${HOME}"
+DEST_HOME="${OC_CONSTRUCT_HOME:-${HOME}/.config/construct-cli/home}"
+
+export OC_CONSTRUCT_DEST_HOME="$DEST_HOME"
+
+mkdir -p \
+  "${DEST_HOME}/.config" \
+  "${DEST_HOME}/.opencode" \
+  "${DEST_HOME}/.local/share" \
+  "${DEST_HOME}/.local/state"
+
+# Copy OpenCode config tree used by WALID.
+mkdir -p "${DEST_HOME}/.config/opencode"
+
+# Avoid copying repo metadata if ~/.config/opencode is itself a git checkout.
+shopt -s dotglob nullglob
+for item in "${SRC_HOME}/.config/opencode"/*; do
+  base=$(basename "$item")
+  if [[ "$base" == ".git" ]]; then
+    continue
+  fi
+  cp -a "$item" "${DEST_HOME}/.config/opencode/"
+done
+shopt -u dotglob nullglob
+
+# Copy safety-rail plugins.
+if [[ -d "${SRC_HOME}/.opencode/plugin" ]]; then
+  mkdir -p "${DEST_HOME}/.opencode"
+  cp -a "${SRC_HOME}/.opencode/plugin" "${DEST_HOME}/.opencode/"
+fi
+
+# Copy OpenCode auth state used by provider/auth plugins.
+if [[ -d "${SRC_HOME}/.local/share/opencode" ]]; then
+  mkdir -p "${DEST_HOME}/.local/share/opencode"
+  for f in auth.json codex-accounts.json antigravity-accounts.json; do
+    if [[ -f "${SRC_HOME}/.local/share/opencode/${f}" ]]; then
+      cp -a "${SRC_HOME}/.local/share/opencode/${f}" "${DEST_HOME}/.local/share/opencode/${f}"
+    fi
+  done
+fi
+
+# Copy availability state so away/night rules apply inside Construct.
+if [[ -f "${SRC_HOME}/.local/state/opencode/availability.json" ]]; then
+  mkdir -p "${DEST_HOME}/.local/state/opencode"
+  cp -a "${SRC_HOME}/.local/state/opencode/availability.json" "${DEST_HOME}/.local/state/opencode/availability.json"
+fi
+
+# Rewrite absolute host paths in Construct-local OpenCode configs.
+# Host configs reference plugins via file:///home/elwalid/... which won't exist in the container.
+python3 - <<'PY'
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+dest_home = Path(os.environ["OC_CONSTRUCT_DEST_HOME"])
+
+replacements = {
+    "file:///home/elwalid/": "file:///home/construct/",
+}
+
+for rel in [
+    ".config/opencode/opencode.json",
+    ".config/opencode/opencode.away.json",
+]:
+    p = dest_home / rel
+    if not p.exists():
+        continue
+    s = p.read_text(encoding="utf-8")
+    for a, b in replacements.items():
+        s = s.replace(a, b)
+    p.write_text(s, encoding="utf-8")
+
+# Ensure we never carry git metadata into Construct home.
+git_dir = dest_home / ".config/opencode/.git"
+if git_dir.exists():
+    import shutil
+    shutil.rmtree(git_dir, ignore_errors=True)
+PY
+
+echo "ok: synced to ${DEST_HOME}"

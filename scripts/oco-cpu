@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# oco-cpu - the oco agent lane with CPU-only inference and a 32K context.
+
+set -euo pipefail
+
+export OCO_LLAMA_PORT="${OCO_CPU_LLAMA_PORT:-18087}"
+export OCO_PORT="${OCO_CPU_PORT:-18088}"
+export OCO_BASE_URL="${OCO_CPU_BASE_URL:-http://127.0.0.1:$OCO_PORT/v1}"
+export OCO_MODEL="${OCO_CPU_MODEL:-llama.openclaw-cpu/qwen35-opus-openclaw-cpu}"
+export OCO_AGENT="${OCO_CPU_AGENT:-local-openclaw-cpu}"
+export OCO_NGL=0
+export OCO_DEVICE=none
+export OCO_THREADS="${OCO_CPU_THREADS:-2}"
+export OCO_THREADS_BATCH="${OCO_CPU_THREADS_BATCH:-$OCO_THREADS}"
+export OCO_PARALLEL=1
+export OCO_FLASH_ATTN=auto
+export OCO_CACHE_RAM="${OCO_CPU_CACHE_RAM:-2048}"
+export OCO_ASK_CTX="${OCO_CPU_ASK_CTX:-8192}"
+export OCO_FULL_CTX="${OCO_CPU_CTX:-32768}"
+export OCO_LANE_LABEL="local Qwen3.5 Opus/OpenClaw CPU lane"
+export OCO_RESOURCE_LABEL="CPU/RAM"
+export OCO_STARTUP_NOTE="${OCO_CPU_STARTUP_NOTE:-10-30s; first OpenCode turn may take 30-90+ minutes on an 8-core CPU}"
+export OCO_WAIT_TIMEOUT="${OCO_CPU_WAIT_TIMEOUT:-120}"
+export OCO_SERVER_LOG_NAME=qwen35-opus-openclaw-cpu.log
+export OCO_PROXY_LOG_NAME=qwen35-opus-openclaw-cpu-proxy.log
+export OCO_COMMAND_NAME=oco-cpu
+export OCO_SHOW_GPU=0
+export MAX_CPU_C="${OCO_CPU_MAX_C:-80}"
+
+exec "${OCO_LAUNCHER:-$HOME/.local/bin/oco}" "$@"

@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# oco - OpenCode with local Qwen3.5 Opus/OpenClaw distilled, started on demand.
+
+set -euo pipefail
+
+ROOT="${ASAYL_LLM_ROOT:-$HOME/asayl-local-llm}"
+LLAMA_PORT="${OCO_LLAMA_PORT:-18085}"
+PORT="${OCO_PORT:-18086}"
+BASE_URL="${OCO_BASE_URL:-http://127.0.0.1:$PORT/v1}"
+MODEL_ID="${OCO_MODEL:-llama.openclaw/qwen35-opus-openclaw}"
+AGENT_ID="${OCO_AGENT:-local-openclaw}"
+WAIT_TIMEOUT="${OCO_WAIT_TIMEOUT:-75}"
+CTX="${OCO_CTX:-}"
+NGL="${OCO_NGL:-99}"
+THREADS="${OCO_THREADS:-10}"
+THREADS_BATCH="${OCO_THREADS_BATCH:-$THREADS}"
+DEVICE="${OCO_DEVICE:-}"
+CACHE_TYPE_K="${OCO_CACHE_TYPE_K:-}"
+CACHE_TYPE_V="${OCO_CACHE_TYPE_V:-}"
+CACHE_RAM="${OCO_CACHE_RAM:-}"
+PARALLEL="${OCO_PARALLEL:-1}"
+FLASH_ATTN="${OCO_FLASH_ATTN:-on}"
+TEMP="${OCO_TEMP:-0.3}"
+ASK_CTX="${OCO_ASK_CTX:-8192}"
+FULL_CTX="${OCO_FULL_CTX:-16384}"
+LANE_LABEL="${OCO_LANE_LABEL:-local Qwen3.5 Opus/OpenClaw}"
+RESOURCE_LABEL="${OCO_RESOURCE_LABEL:-GPU}"
+STARTUP_NOTE="${OCO_STARTUP_NOTE:-6-18s, up to ~30s cold cache}"
+SERVER_LOG_NAME="${OCO_SERVER_LOG_NAME:-qwen35-opus-openclaw.log}"
+PROXY_LOG_NAME="${OCO_PROXY_LOG_NAME:-qwen35-opus-openclaw-proxy.log}"
+COMMAND_NAME="${OCO_COMMAND_NAME:-oco}"
+SHOW_GPU="${OCO_SHOW_GPU:-1}"
+STOP_AFTER="${OCO_STOP_AFTER:-1}"
+STARTED_BY_OCO=0
+CLEANUP_ARMED=0
+ALLOWED_TOOLS="${OCO_ALLOWED_TOOLS:-glob,grep,read,bash,edit,write,todowrite}"
+
+usage() {
+  cat <<EOF
+$LANE_LABEL - start Qwen3.5 Opus/OpenClaw and open OpenCode with it selected
+
+Usage:
+  $COMMAND_NAME [project-or-opencode-args...]
+  $COMMAND_NAME ask "quick local question"
+  $COMMAND_NAME run "prompt"
+  $COMMAND_NAME --status
+  $COMMAND_NAME --stop
+  $COMMAND_NAME --keep-server [args...]
+
+Defaults:
+  model:     $MODEL_ID
+  agent:     $AGENT_ID
+  endpoint:  $BASE_URL
+  context:   ask uses $ASK_CTX by default; full OpenCode uses $FULL_CTX
+  compute:   $RESOURCE_LABEL
+
+Images:
+  Not enabled in this text-agent command.
+EOF
+}
+
+api_ready() {
+  curl -fsS --max-time 2 "$BASE_URL/models" >/dev/null 2>&1
+}
+
+llama_ready() {
+  curl -fsS --max-time 2 "http://127.0.0.1:$LLAMA_PORT/v1/models" >/dev/null 2>&1
+}
+
+owned_server_running() {
+  local pid_file="$ROOT/logs/llama-server-$LLAMA_PORT.pid"
+  [[ -f "$pid_file" ]] || return 1
+
+  local pid
+  pid="$(<"$pid_file")"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
+
+  local cmdline
+  cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *llama-server* && "$cmdline" == *"--port $LLAMA_PORT"* ]]
+}
+
+status() {
+  if api_ready; then
+    echo "OpenClaw proxy: ready at $BASE_URL"
+  else
+    echo "OpenClaw proxy: not ready at $BASE_URL"
+  fi
+  if llama_ready; then
+    echo "llama.cpp upstream: ready at http://127.0.0.1:$LLAMA_PORT/v1"
+  else
+    echo "llama.cpp upstream: not ready at http://127.0.0.1:$LLAMA_PORT/v1"
+  fi
+
+  for pid_file in "$ROOT/logs/llama-server-$LLAMA_PORT.pid" "$ROOT/logs/llama-tool-proxy-$PORT.pid"; do
+    if [[ -f "$pid_file" ]]; then
+      pid="$(<"$pid_file")"
+      ps -p "$pid" -o pid,stat,pcpu,pmem,rss,etime,comm,args 2>/dev/null || true
+    fi
+  done
+
+  if [[ "$SHOW_GPU" == "1" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits || true
+  fi
+  free -h | awk 'NR == 1 || /^Mem:|^Swap:/' || true
+}
+
+stop_server() {
+  local proxy_pid_file="$ROOT/logs/llama-tool-proxy-$PORT.pid"
+  if [[ -f "$proxy_pid_file" ]]; then
+    local proxy_pid
+    proxy_pid="$(<"$proxy_pid_file")"
+    if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
+      kill "$proxy_pid" 2>/dev/null || true
+    fi
+    rm -f "$proxy_pid_file"
+  fi
+  PORT="$LLAMA_PORT" bash "$ROOT/scripts/stop-llm.sh"
+  tmux kill-session -t "asayl-llm-$LLAMA_PORT" 2>/dev/null || true
+}
+
+start_proxy() {
+  if api_ready; then
+    return 0
+  fi
+
+  local proxy_pid_file="$ROOT/logs/llama-tool-proxy-$PORT.pid"
+  local proxy_log="$ROOT/logs/$PROXY_LOG_NAME"
+  if [[ -f "$proxy_pid_file" ]]; then
+    local old_pid
+    old_pid="$(<"$proxy_pid_file")"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null || true
+    fi
+    rm -f "$proxy_pid_file"
+  fi
+
+  echo "Starting OpenClaw tool-call proxy on 127.0.0.1:$PORT." >&2
+  LLAMA_PROXY_UPSTREAM="http://127.0.0.1:$LLAMA_PORT" \
+    LLAMA_PROXY_HOST="127.0.0.1" \
+    LLAMA_PROXY_PORT="$PORT" \
+    LLAMA_PROXY_ALLOWED_TOOLS="$ALLOWED_TOOLS" \
+    nohup python3 "$ROOT/scripts/llama_tool_stream_proxy.py" >>"$proxy_log" 2>&1 &
+  printf '%s\n' "$!" >"$proxy_pid_file"
+}
+
+start_server() {
+  if api_ready && llama_ready; then
+    if owned_server_running; then
+      STARTED_BY_OCO=1
+      arm_cleanup
+    fi
+    return 0
+  fi
+
+  echo "Starting $LANE_LABEL. Expected server load: $STARTUP_NOTE." >&2
+  if ! llama_ready; then
+    LLAMA_BIN="${LLAMA_BIN:-/run/current-system/sw/bin/llama-server}" \
+      PORT="$LLAMA_PORT" CTX="$CTX" NGL="$NGL" THREADS="$THREADS" \
+      THREADS_BATCH="$THREADS_BATCH" DEVICE="$DEVICE" \
+      CACHE_TYPE_K="$CACHE_TYPE_K" CACHE_TYPE_V="$CACHE_TYPE_V" \
+      CACHE_RAM="$CACHE_RAM" \
+      PARALLEL="$PARALLEL" FLASH_ATTN="$FLASH_ATTN" TEMP="$TEMP" \
+      LOG_NAME="$SERVER_LOG_NAME" \
+      MAX_CPU_C="${MAX_CPU_C:-85}" MAX_GPU_C="${MAX_GPU_C:-78}" \
+      bash "$ROOT/scripts/run-qwen35-opus-openclaw.sh" >&2
+  fi
+  start_proxy
+
+  STARTED_BY_OCO=1
+  arm_cleanup
+
+  local i
+  for ((i = 1; i <= WAIT_TIMEOUT; i++)); do
+    if api_ready; then
+      echo "Local OpenClaw model is ready for OpenCode at $BASE_URL" >&2
+      return 0
+    fi
+    if (( i % 5 == 0 )); then
+      echo "Waiting for local OpenClaw model... ${i}s" >&2
+    fi
+    sleep 1
+  done
+
+  echo "Timed out waiting for local OpenClaw model at $BASE_URL" >&2
+  tail -80 "$ROOT/logs/$SERVER_LOG_NAME" >&2 2>/dev/null || true
+  return 1
+}
+
+cleanup_server() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [[ "$STOP_AFTER" == "1" && "$STARTED_BY_OCO" == "1" ]]; then
+    stop_server >/dev/null 2>&1 || true
+  fi
+  return "$status"
+}
+
+arm_cleanup() {
+  if [[ "$STOP_AFTER" == "1" && "$STARTED_BY_OCO" == "1" && "$CLEANUP_ARMED" == "0" ]]; then
+    CLEANUP_ARMED=1
+    trap cleanup_server EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+  fi
+}
+
+ask_model() {
+  local prompt="$*"
+  if [[ -z "$prompt" && ! -t 0 ]]; then
+    prompt="$(cat)"
+  fi
+  if [[ -z "$prompt" ]]; then
+    echo "oco ask needs a prompt or stdin." >&2
+    return 2
+  fi
+
+  local max_tokens="${OCO_ASK_MAX_TOKENS:-1024}"
+  local payload
+  payload="$(
+    jq -n \
+      --arg prompt "$prompt" \
+      --argjson max_tokens "$max_tokens" \
+      '{
+        model: "local",
+        messages: [
+          {role: "system", content: "You are a concise local coding assistant. This text-only command cannot inspect images."},
+          {role: "user", content: $prompt}
+        ],
+        temperature: 0.3,
+        max_tokens: $max_tokens
+      }'
+  )"
+
+  curl -fsS "$BASE_URL/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload" |
+    jq -r '.choices[0].message.content'
+}
+
+open_opencode() {
+  export GEMINI_API_KEY=
+  export OPENCODE_EXPERIMENTAL=1
+
+  if [[ $# -gt 0 && "$1" == "run" ]]; then
+    shift
+    echo "Opening OpenCode run with $LANE_LABEL. It will stop when this command exits if this launcher started it." >&2
+    oc run --agent "$AGENT_ID" "$@"
+    return $?
+  fi
+
+  echo "Opening OpenCode with $LANE_LABEL. It will stop when OpenCode exits if this launcher started it." >&2
+  echo "Use the same launcher's --stop command from another terminal to release $RESOURCE_LABEL immediately." >&2
+  oc --agent "$AGENT_ID" "$@"
+}
+
+main() {
+  local args=()
+  local ask_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; return 0 ;;
+      --status) status; return 0 ;;
+      --stop) stop_server; return 0 ;;
+      --keep-server|--no-stop) STOP_AFTER=0; shift ;;
+      ask) ask_mode=1; shift; args+=("$@"); break ;;
+      --) shift; args+=("$@"); break ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ -z "$CTX" ]]; then
+    if [[ "$ask_mode" == "1" ]]; then
+      CTX="$ASK_CTX"
+    else
+      CTX="$FULL_CTX"
+    fi
+  fi
+
+  start_server
+
+  arm_cleanup
+
+  if [[ "$ask_mode" == "1" ]]; then
+    ask_model "${args[@]}"
+    return $?
+  fi
+
+  open_opencode "${args[@]}"
+}
+
+main "$@"

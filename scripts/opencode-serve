@@ -1,0 +1,13 @@
+#!/run/current-system/sw/bin/bash
+
+set -euo pipefail
+
+export OPENCODE_CONFIG="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
+export OPENCODE_NOTIFY_POPUP="${OPENCODE_NOTIFY_POPUP:-0}"
+export OPENCODE_NOTIFY_SOUND="${OPENCODE_NOTIFY_SOUND:-0}"
+
+exec "$HOME/.local/bin/opencode" serve \
+  --port "${OPENCODE_SERVE_PORT:-4099}" \
+  --hostname "${OPENCODE_SERVE_HOSTNAME:-127.0.0.1}" \
+  --log-level "${OPENCODE_SERVE_LOG_LEVEL:-WARN}" \
+  "$@"

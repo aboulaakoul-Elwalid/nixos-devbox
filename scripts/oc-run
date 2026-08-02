@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  oc-run <path/to/task.yaml> [--keep] [--run-id <id>] [--attempt <n>]
+
+Runs one WALID task attempt in an isolated git worktree, using oc-walk/oc-night.
+Produces artifacts under:
+  docs/walid_runs/<task-name>/<timestamp>/attempt-XX/
+
+Notes:
+- task.yaml is currently JSON-compatible YAML.
+- This does not auto-apply results back to your working tree.
+EOF
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+keep=false
+run_id=""
+attempt_num=1
+task_path=${1:-}
+if [[ -z "$task_path" ]]; then
+  usage >&2
+  exit 2
+fi
+shift || true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --keep)
+      keep=true
+      shift
+      ;;
+    --run-id)
+      run_id="${2:-}"
+      shift 2
+      ;;
+    --attempt)
+      attempt_num="${2:-}"
+      shift 2
+      ;;
+    *)
+      echo "oc-run: unknown arg: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "oc-run: must run inside a git repo" >&2
+  exit 2
+fi
+root=$(git rev-parse --show-toplevel)
+
+task_abs="$task_path"
+if [[ "$task_abs" != /* ]]; then
+  task_abs="$PWD/$task_abs"
+fi
+if [[ ! -f "$task_abs" ]]; then
+  echo "oc-run: task file not found: $task_abs" >&2
+  exit 2
+fi
+
+python_json() {
+  python3 - "$task_abs" "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+data = json.loads(p.read_text(encoding="utf-8"))
+key = sys.argv[2]
+
+def get(d, path):
+    cur = d
+    for part in path.split('.'):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+v = get(data, key)
+if v is None:
+    sys.exit(3)
+if isinstance(v, (dict, list)):
+    print(json.dumps(v))
+else:
+    print(v)
+PY
+}
+
+task_dir=$(dirname "$task_abs")
+task_name=$(python_json name || true)
+if [[ -z "$task_name" ]]; then
+  task_name=$(basename "$task_dir")
+fi
+
+prompt_file_rel=$(python_json prompt_file || true)
+if [[ -z "$prompt_file_rel" ]]; then
+  prompt_file_rel="PROMPT.md"
+fi
+prompt_path="$task_dir/$prompt_file_rel"
+if [[ ! -f "$prompt_path" ]]; then
+  echo "oc-run: missing prompt file: $prompt_path" >&2
+  exit 2
+fi
+
+mode=$(python_json mode || true)
+if [[ -z "$mode" ]]; then
+  mode="walk"
+fi
+
+sandbox_backend=$(python_json sandbox.backend || true)
+if [[ -z "$sandbox_backend" ]]; then
+  sandbox_backend="construct"
+fi
+
+gates_json=$(python_json gates || true)
+if [[ -z "$gates_json" ]]; then
+  echo "oc-run: task.yaml missing 'gates'" >&2
+  exit 2
+fi
+
+ts=$(date +%Y%m%d-%H%M%S)
+if [[ -z "$run_id" ]]; then
+  run_id="$ts"
+fi
+
+printf -v attempt_label 'attempt-%02d' "$attempt_num"
+attempt_dir="$root/docs/walid_runs/$task_name/$run_id/$attempt_label"
+mkdir -p "$attempt_dir"
+
+worktree_dir="$attempt_dir/worktree"
+git -C "$root" worktree add --detach "$worktree_dir" >/dev/null
+
+cleanup() {
+  if [[ "$keep" == "true" ]]; then
+    echo "keep: $worktree_dir" >&2
+    return
+  fi
+  git -C "$root" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+cp -a "$task_dir" "$attempt_dir/task"
+cp -a "$prompt_path" "$attempt_dir/PROMPT.md"
+
+title="task-${task_name}-${run_id}-${attempt_label}"
+
+run_log="$attempt_dir/opencode.log"
+run_rc=0
+
+(
+  cd "$worktree_dir"
+  set +e
+  if [[ "$sandbox_backend" == "construct" ]]; then
+    if [[ "$mode" == "night" ]]; then
+      OC_NIGHT_TITLE="$title" /home/elwalid/bin/oc-night --sandbox construct -- "$(cat "$prompt_path")" 2>&1 | tee "$run_log"
+      rc=${PIPESTATUS[0]}
+    else
+      OC_WALK_TITLE="$title" /home/elwalid/bin/oc-walk --sandbox construct -- "$(cat "$prompt_path")" 2>&1 | tee "$run_log"
+      rc=${PIPESTATUS[0]}
+    fi
+  else
+    if [[ "$mode" == "night" ]]; then
+      OC_NIGHT_TITLE="$title" /home/elwalid/bin/oc-night --sandbox host -- "$(cat "$prompt_path")" 2>&1 | tee "$run_log"
+      rc=${PIPESTATUS[0]}
+    else
+      OC_WALK_TITLE="$title" /home/elwalid/bin/oc-walk --sandbox host -- "$(cat "$prompt_path")" 2>&1 | tee "$run_log"
+      rc=${PIPESTATUS[0]}
+    fi
+  fi
+  echo "${rc:-0}" >"$attempt_dir/opencode.rc"
+)
+
+run_rc=$(cat "$attempt_dir/opencode.rc" 2>/dev/null || echo 0)
+
+session_json="$attempt_dir/session.json"
+export OC_RUN_LOGFILE="$run_log"
+export OC_RUN_SESSION_JSON="$session_json"
+export OC_RUN_WORKTREE_DIR="$worktree_dir"
+python3 - <<'PY'
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+run_log = Path(os.environ["OC_RUN_LOGFILE"])
+out = Path(os.environ["OC_RUN_SESSION_JSON"])
+worktree_dir = Path(os.environ["OC_RUN_WORKTREE_DIR"])
+
+if not run_log.exists():
+    out.write_text("{}\n", encoding="utf-8")
+    raise SystemExit(0)
+
+m = None
+for line in run_log.read_text(encoding="utf-8", errors="replace").splitlines():
+    if line.startswith("Export: "):
+        m = line[len("Export: "):].strip()
+
+if not m:
+    out.write_text("{}\n", encoding="utf-8")
+    raise SystemExit(0)
+
+export_path = Path(m)
+if not export_path.is_absolute():
+    export_path = worktree_dir / export_path
+
+if export_path.exists():
+    out.write_text(export_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+else:
+    out.write_text("{}\n", encoding="utf-8")
+PY
+
+patch_file="$attempt_dir/patch.diff"
+git -C "$worktree_dir" diff >"$patch_file" || true
+
+gates_log="$attempt_dir/gates.log"
+gates_pass=true
+
+python3 - <<PY
+import json
+from pathlib import Path
+
+gates = json.loads('''$gates_json''')
+out = []
+for cmd in gates:
+    out.append(str(cmd))
+Path("$attempt_dir/gates.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+
+while IFS= read -r gate_cmd; do
+  [[ -z "$gate_cmd" ]] && continue
+  echo "\n[gate] $gate_cmd" | tee -a "$gates_log"
+  (
+    cd "$worktree_dir"
+    bash -lc "$gate_cmd"
+  ) >>"$gates_log" 2>&1 || gates_pass=false
+done <"$attempt_dir/gates.txt"
+
+result_json="$attempt_dir/result.json"
+python3 - <<PY
+import json
+from pathlib import Path
+
+res = {
+  "task": "$task_name",
+  "mode": "$mode",
+  "sandbox_backend": "$sandbox_backend",
+  "timestamp": "$ts",
+  "attempt": 1,
+  "opencode_exit": int("$run_rc"),
+  "gates_pass": bool("$gates_pass" == "true"),
+}
+Path("$result_json").write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+PY
+
+echo "Artifacts: $attempt_dir"

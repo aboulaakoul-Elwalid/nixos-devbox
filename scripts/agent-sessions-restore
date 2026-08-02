@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# agent-sessions-restore — reopen every captured agent session in its own
+# Ghostty terminal, resuming the exact conversation where possible.
+#
+# Runs from Hyprland autostart (`exec-once = sleep 30 && ...`) so it inherits
+# WAYLAND_DISPLAY. Boot-id gated: a Hyprland config reload re-runs exec-once,
+# and this must not spawn a second copy of every terminal.
+#
+# Flags:
+#   --dry-run   log the commands it would run, spawn nothing
+#   --force     ignore the per-boot marker and restore anyway
+set -uo pipefail
+
+CFG="$HOME/.config/agent-sessions"
+STATE="$HOME/.local/state/agent-sessions"
+MANIFEST="$CFG/manifest.json"
+
+CLAUDE_BIN="$HOME/.local/bin/claude"
+CODEX_BIN="$HOME/.npm-global/bin/codex"
+OPENCODE_BIN="$HOME/.npm-global/bin/opencode"
+SHELL_BIN="/run/current-system/sw/bin/zsh"
+# kitty is the daily terminal here and honors --class (ghostty is single-instance
+# and ignores it). Override with AGENT_SESSIONS_TERMINAL if you switch terminals.
+TERMINAL="${AGENT_SESSIONS_TERMINAL:-/run/current-system/sw/bin/kitty}"
+
+MAX="${AGENT_SESSIONS_MAX:-30}"
+STAGGER="${AGENT_SESSIONS_STAGGER:-0.4}"
+
+DRY=0; FORCE=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --force)   FORCE=1 ;;
+  esac
+done
+
+mkdir -p "$STATE"
+log() { printf '%s restore: %s\n' "$(date +%FT%T)" "$*" >>"$STATE/restore.log"; }
+
+boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+marker="$STATE/restored-$boot"
+
+if [ "$DRY" -eq 0 ] && [ "$FORCE" -eq 0 ] && [ -e "$marker" ]; then
+  log "already restored for boot $boot; skip"
+  exit 0
+fi
+
+if [ ! -f "$MANIFEST" ]; then
+  log "no manifest at $MANIFEST; nothing to restore"
+  [ "$DRY" -eq 0 ] && touch "$marker"
+  exit 0
+fi
+
+launch() { # dir title cmd
+  local dir="$1" title="$2" cmd="$3"
+  local qdir; qdir="$(printf '%q' "$dir")"
+  local inner="cd $qdir 2>/dev/null; $cmd; ec=\$?; echo; echo \"[agent-sessions] '$cmd' exited (\$ec) — shell kept open\"; exec ${SHELL_BIN} -i"
+  if [ "$DRY" -eq 1 ]; then
+    log "DRY would spawn [$title]: $cmd  (cwd=$dir)"
+    printf '  %-9s %s\n    -> %s\n' "$title" "$dir" "$cmd"
+    return
+  fi
+  setsid -f "$TERMINAL" \
+    --class=agent-session \
+    --title="$title" \
+    --directory="$dir" \
+    "$SHELL_BIN" -lc "$inner" >/dev/null 2>&1
+}
+
+n=0
+while IFS=$'\t' read -r agent dir session resume; do
+  [ -n "${agent:-}" ] || continue
+  n=$((n+1))
+  if [ "$n" -gt "$MAX" ]; then
+    log "hit MAX=$MAX; dropping remaining $(( )) session(s)"
+    echo "[agent-sessions] stopped at MAX=$MAX; edit AGENT_SESSIONS_MAX to raise" >&2
+    break
+  fi
+  case "$agent" in
+    claude)
+      if [ "$resume" = id ]; then cmd="$CLAUDE_BIN --resume $session"; else cmd="$CLAUDE_BIN --continue"; fi ;;
+    codex)
+      if [ "$resume" = id ]; then cmd="$CODEX_BIN resume $session"; else cmd="$CODEX_BIN resume --last"; fi ;;
+    opencode)
+      cmd="$OPENCODE_BIN --continue" ;;
+    *)
+      log "unknown agent '$agent'; skip"; n=$((n-1)); continue ;;
+  esac
+  launch "$dir" "agent:$agent:$(basename "$dir")" "$cmd"
+  log "spawned $agent in $dir (resume=$resume session=$session)"
+  [ "$DRY" -eq 0 ] && sleep "$STAGGER"
+done < <(jq -r '.sessions[] | [.agent, .dir, (.session // "last"), (.resume // "continue")] | @tsv' "$MANIFEST" 2>/dev/null)
+
+if [ "$DRY" -eq 0 ]; then
+  touch "$marker"
+  # prune markers from previous boots
+  find "$STATE" -maxdepth 1 -name 'restored-*' ! -name "restored-$boot" -delete 2>/dev/null
+fi
+log "restore complete: $n session(s) (dry=$DRY)"
+[ "$DRY" -eq 1 ] && echo "[agent-sessions] dry-run: $n session(s) would be restored"
+exit 0

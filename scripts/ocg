@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# ocg - OpenCode with local Gemma, started on demand.
+
+set -euo pipefail
+
+ROOT="${ASAYL_LLM_ROOT:-$HOME/asayl-local-llm}"
+PORT="${OCG_PORT:-18083}"
+BASE_URL="${OCG_BASE_URL:-http://127.0.0.1:$PORT/v1}"
+MODEL_ID="${OCG_MODEL:-llama.gemma/gemma-3-4b-vision}"
+AGENT_ID="${OCG_AGENT:-local-gemma}"
+WAIT_TIMEOUT="${OCG_WAIT_TIMEOUT:-75}"
+CTX="${OCG_CTX:-}"
+NGL="${OCG_NGL:-99}"
+THREADS="${OCG_THREADS:-6}"
+STOP_AFTER="${OCG_STOP_AFTER:-1}"
+STARTED_BY_OCG=0
+CLEANUP_ARMED=0
+
+usage() {
+  cat <<EOF
+ocg - start local Gemma vision and open OpenCode with it selected
+
+Usage:
+  ocg [project-or-opencode-args...]
+  ocg ask "quick local Gemma question"
+  ocg image /path/to/image.png "what do you see?"
+  ocg run "prompt"
+  ocg --status
+  ocg --stop
+  ocg --keep-server [args...]
+
+Defaults:
+  model:     $MODEL_ID
+  endpoint:  $BASE_URL
+  context:   ask and OpenCode use 8192 by default
+
+Startup time:
+  Expected ~8-15s once downloaded; up to ~25s cold cache.
+
+Images:
+  Uses the same local Gemma 3 4B vision lane as dailylog-caption-screenshots.
+  Use 'ocg image <file> [prompt]' for a direct endpoint smoke test.
+EOF
+}
+
+api_ready() {
+  curl -fsS --max-time 2 "$BASE_URL/models" >/dev/null 2>&1
+}
+
+owned_server_running() {
+  local pid_file="$ROOT/logs/llama-server-$PORT.pid"
+  [[ -f "$pid_file" ]] || return 1
+
+  local pid
+  pid="$(<"$pid_file")"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 1
+
+  local cmdline
+  cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *llama-server* && "$cmdline" == *"--port $PORT"* ]]
+}
+
+status() {
+  if api_ready; then
+    echo "Gemma endpoint: ready at $BASE_URL"
+  else
+    echo "Gemma endpoint: not ready at $BASE_URL"
+  fi
+
+  local pid_file="$ROOT/logs/llama-server-$PORT.pid"
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid="$(<"$pid_file")"
+    ps -p "$pid" -o pid,stat,pcpu,pmem,rss,etime,comm,args 2>/dev/null || true
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits || true
+  fi
+}
+
+stop_server() {
+  PORT="$PORT" bash "$ROOT/scripts/stop-llm.sh"
+  tmux kill-session -t "asayl-llm-$PORT" 2>/dev/null || true
+}
+
+start_server() {
+  if api_ready; then
+    if owned_server_running; then
+      STARTED_BY_OCG=1
+      arm_cleanup
+    fi
+    return 0
+  fi
+
+  echo "Starting local Gemma 3 vision. Expected wait: 8-15s, up to ~25s cold cache." >&2
+  local default_llama_bin="/run/current-system/sw/bin/llama-server"
+
+  LLAMA_BIN="${LLAMA_BIN:-$default_llama_bin}" \
+    PORT="$PORT" CTX="$CTX" NGL="$NGL" THREADS="$THREADS" \
+    MAX_CPU_C="${MAX_CPU_C:-85}" MAX_GPU_C="${MAX_GPU_C:-78}" \
+    bash "$ROOT/scripts/run-gemma3-4b-vision.sh" >&2
+
+  STARTED_BY_OCG=1
+  arm_cleanup
+
+  local i
+  for ((i = 1; i <= WAIT_TIMEOUT; i++)); do
+    if api_ready; then
+      echo "Local Gemma is ready at $BASE_URL" >&2
+      return 0
+    fi
+    if (( i % 5 == 0 )); then
+      echo "Waiting for local Gemma... ${i}s" >&2
+    fi
+    sleep 1
+  done
+
+  echo "Timed out waiting for local Gemma at $BASE_URL" >&2
+  echo "Recent server log:" >&2
+  tail -80 "$ROOT/logs/gemma3-4b-vision.log" >&2 2>/dev/null || true
+  return 1
+}
+
+cleanup_server() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [[ "$STOP_AFTER" == "1" && "$STARTED_BY_OCG" == "1" ]]; then
+    stop_server >/dev/null 2>&1 || true
+  fi
+  return "$status"
+}
+
+arm_cleanup() {
+  if [[ "$STOP_AFTER" == "1" && "$STARTED_BY_OCG" == "1" && "$CLEANUP_ARMED" == "0" ]]; then
+    CLEANUP_ARMED=1
+    trap cleanup_server EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+  fi
+}
+
+ask_gemma() {
+  local prompt="$*"
+  if [[ -z "$prompt" && ! -t 0 ]]; then
+    prompt="$(cat)"
+  fi
+  if [[ -z "$prompt" ]]; then
+    echo "ocg ask needs a prompt or stdin." >&2
+    return 2
+  fi
+
+  local max_tokens="${OCG_ASK_MAX_TOKENS:-1024}"
+  local payload
+  payload="$(
+    jq -n \
+      --arg prompt "$prompt" \
+      --argjson max_tokens "$max_tokens" \
+      '{
+        model: "local",
+        messages: [
+          {role: "system", content: "You are a concise local coding assistant. Answer directly."},
+          {role: "user", content: $prompt}
+        ],
+        temperature: 0,
+        max_tokens: $max_tokens
+      }'
+  )"
+
+  curl -fsS "$BASE_URL/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload" |
+    jq -r '.choices[0].message.content'
+}
+
+image_gemma() {
+  local image_path="${1:-}"
+  shift || true
+  if [[ -z "$image_path" ]]; then
+    echo "ocg image needs an image path." >&2
+    return 2
+  fi
+  if [[ ! -f "$image_path" ]]; then
+    echo "Image not found: $image_path" >&2
+    return 2
+  fi
+
+  local prompt="$*"
+  if [[ -z "$prompt" ]]; then
+    prompt="Describe this image in detail."
+  fi
+
+  local mime
+  if command -v file >/dev/null 2>&1; then
+    mime="$(file --mime-type -b "$image_path" 2>/dev/null || true)"
+  else
+    case "${image_path,,}" in
+      *.png) mime="image/png" ;;
+      *.jpg|*.jpeg) mime="image/jpeg" ;;
+      *.webp) mime="image/webp" ;;
+      *.gif) mime="image/gif" ;;
+      *) mime="" ;;
+    esac
+  fi
+  case "$mime" in
+    image/*) ;;
+    *) echo "Not an image file according to file(1): $image_path ($mime)" >&2; return 2 ;;
+  esac
+
+  local max_tokens="${OCG_IMAGE_MAX_TOKENS:-768}"
+  local image_b64 image_url payload
+  image_b64="$(base64 -w 0 "$image_path")"
+  image_url="data:${mime};base64,${image_b64}"
+  payload="$(
+    jq -n \
+      --arg prompt "$prompt" \
+      --arg image_url "$image_url" \
+      --argjson max_tokens "$max_tokens" \
+      '{
+        model: "local",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {type: "text", text: $prompt},
+              {type: "image_url", image_url: {url: $image_url}}
+            ]
+          }
+        ],
+        temperature: 0,
+        max_tokens: $max_tokens
+      }'
+  )"
+
+  curl -fsS "$BASE_URL/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload" |
+    jq -r '.choices[0].message.content // .choices[0].message.reasoning_content // empty'
+}
+
+open_opencode() {
+  export GEMINI_API_KEY=
+  export OPENCODE_EXPERIMENTAL=1
+
+  if [[ $# -gt 0 && "$1" == "run" ]]; then
+    shift
+    echo "Opening OpenCode run with local Gemma. Gemma will stay running until this command exits." >&2
+    oc run --agent "$AGENT_ID" "$@"
+    return $?
+  fi
+
+  echo "Opening OpenCode with local Gemma. Gemma will stay running until OpenCode exits." >&2
+  echo "Use 'ocg --stop' from another terminal if you want the GPU back immediately." >&2
+  oc --agent "$AGENT_ID" "$@"
+}
+
+main() {
+  local args=()
+  local ask_mode=0
+  local image_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --status)
+        status
+        return 0
+        ;;
+      --stop)
+        stop_server
+        return 0
+        ;;
+      --keep-server|--no-stop)
+        STOP_AFTER=0
+        shift
+        ;;
+      ask)
+        ask_mode=1
+        shift
+        args+=("$@")
+        break
+        ;;
+      image)
+        image_mode=1
+        shift
+        args+=("$@")
+        break
+        ;;
+      --)
+        shift
+        args+=("$@")
+        break
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$CTX" ]]; then
+    if [[ "$ask_mode" == "1" || "$image_mode" == "1" ]]; then
+      CTX=8192
+    else
+      CTX=8192
+    fi
+  fi
+
+  start_server
+
+  arm_cleanup
+
+  if [[ "$ask_mode" == "1" ]]; then
+    ask_gemma "${args[@]}"
+    return $?
+  fi
+
+  if [[ "$image_mode" == "1" ]]; then
+    image_gemma "${args[@]}"
+    return $?
+  fi
+
+  open_opencode "${args[@]}"
+}
+
+main "$@"

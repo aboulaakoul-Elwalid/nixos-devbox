@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  oc-task init <name>
+
+Creates a WALID task skeleton in the current repo:
+  docs/walid_tasks/<name>/PROMPT.md
+  docs/walid_tasks/<name>/task.yaml   (JSON-compatible YAML)
+EOF
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+cmd=${1:-}
+name=${2:-}
+if [[ -z "$cmd" || -z "$name" ]]; then
+  usage >&2
+  exit 2
+fi
+
+case "$cmd" in
+  init)
+    if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+      echo "oc-task: must run inside a git repo" >&2
+      exit 2
+    fi
+    root=$(git rev-parse --show-toplevel)
+    task_dir="$root/docs/walid_tasks/$name"
+    mkdir -p "$task_dir"
+
+    if [[ ! -f "$task_dir/PROMPT.md" ]]; then
+      cat >"$task_dir/PROMPT.md" <<'EOF'
+# Task
+
+Describe the task clearly.
+
+## Success Criteria
+
+- Gates pass
+- Minimal diff
+- No unrelated changes
+EOF
+    fi
+
+    if [[ ! -f "$task_dir/task.yaml" ]]; then
+      cat >"$task_dir/task.yaml" <<EOF
+{
+  "name": "${name}",
+  "prompt_file": "PROMPT.md",
+  "sandbox": { "backend": "construct" },
+  "mode": "walk",
+  "gates": [
+    "echo 'TODO: add gates (tests/lint/typecheck)'; exit 1"
+  ]
+}
+EOF
+    fi
+
+    echo "ok: $task_dir"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

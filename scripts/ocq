@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# ocq - OpenCode with local Qwen, started on demand.
+
+set -euo pipefail
+
+ROOT="${ASAYL_LLM_ROOT:-$HOME/asayl-local-llm}"
+PORT="${OCQ_PORT:-18081}"
+BASE_URL="${OCQ_BASE_URL:-http://127.0.0.1:$PORT/v1}"
+MODEL_ID="${OCQ_MODEL:-llama.cpp/local-coder}"
+WAIT_TIMEOUT="${OCQ_WAIT_TIMEOUT:-90}"
+CTX="${OCQ_CTX:-24576}"
+NGL="${OCQ_NGL:-40}"
+THREADS="${OCQ_THREADS:-6}"
+N_CPU_MOE="${OCQ_N_CPU_MOE:-999}"
+STOP_AFTER="${OCQ_STOP_AFTER:-1}"
+STARTED_BY_OCQ=0
+
+usage() {
+  cat <<EOF
+ocq - start local Qwen and open OpenCode with it selected
+
+Usage:
+  ocq [project-or-opencode-args...]
+  ocq ask "quick local Qwen question"
+  ocq run "prompt"
+  ocq --status
+  ocq --stop
+  ocq --keep-server [args...]
+
+Defaults:
+  model:     $MODEL_ID
+  endpoint:  $BASE_URL
+  context:   $CTX
+
+Startup time:
+  Usually 10-25s when the model file is cached by the OS; up to ~45s from a cold disk cache.
+
+Lifecycle:
+  ocq ask auto-stops Qwen when it started it.
+  Full ocq keeps Qwen running while OpenCode is open, then stops it when OpenCode exits.
+  If a session gets orphaned or you just want the GPU back: ocq --stop.
+
+Images:
+  Not supported by this Qwen GGUF. This is a text/code model, not a vision model.
+EOF
+}
+
+api_ready() {
+  curl -fsS --max-time 2 "$BASE_URL/models" >/dev/null 2>&1
+}
+
+status() {
+  if api_ready; then
+    echo "Qwen endpoint: ready at $BASE_URL"
+  else
+    echo "Qwen endpoint: not ready at $BASE_URL"
+  fi
+
+  local pid_file="$ROOT/logs/llama-server-$PORT.pid"
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid="$(<"$pid_file")"
+    ps -p "$pid" -o pid,stat,pcpu,pmem,rss,etime,comm,args 2>/dev/null || true
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits || true
+  fi
+}
+
+stop_server() {
+  PORT="$PORT" bash "$ROOT/scripts/stop-llm.sh"
+  tmux kill-session -t "asayl-llm-$PORT" 2>/dev/null || true
+}
+
+ask_qwen() {
+  local prompt="$*"
+  if [[ -z "$prompt" && ! -t 0 ]]; then
+    prompt="$(cat)"
+  fi
+  if [[ -z "$prompt" ]]; then
+    echo "ocq ask needs a prompt or stdin." >&2
+    return 2
+  fi
+
+  local max_tokens="${OCQ_ASK_MAX_TOKENS:-1024}"
+  local payload
+  payload="$(
+    jq -n \
+      --arg prompt "$prompt" \
+      --argjson max_tokens "$max_tokens" \
+      '{
+        model: "local",
+        messages: [
+          {role: "system", content: "You are a concise local coding assistant. Answer directly."},
+          {role: "user", content: $prompt}
+        ],
+        temperature: 0,
+        max_tokens: $max_tokens
+      }'
+  )"
+
+  curl -fsS "$BASE_URL/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload" |
+    jq -r '.choices[0].message.content'
+}
+
+start_server() {
+  if api_ready; then
+    return 0
+  fi
+
+  echo "Starting local Qwen. Expected wait: 10-25s, up to ~45s cold cache." >&2
+  LLAMA_BIN="${LLAMA_BIN:-/run/current-system/sw/bin/llama-server}" \
+    PORT="$PORT" CTX="$CTX" NGL="$NGL" THREADS="$THREADS" N_CPU_MOE="$N_CPU_MOE" \
+    MAX_CPU_C="${MAX_CPU_C:-85}" MAX_GPU_C="${MAX_GPU_C:-78}" \
+    bash "$ROOT/scripts/run-qwen3-coder-30b.sh" >&2
+
+  STARTED_BY_OCQ=1
+
+  local i
+  for ((i = 1; i <= WAIT_TIMEOUT; i++)); do
+    if api_ready; then
+      echo "Local Qwen is ready at $BASE_URL" >&2
+      return 0
+    fi
+    if (( i % 5 == 0 )); then
+      echo "Waiting for local Qwen... ${i}s" >&2
+    fi
+    sleep 1
+  done
+
+  echo "Timed out waiting for local Qwen at $BASE_URL" >&2
+  echo "Recent server log:" >&2
+  tail -80 "$ROOT/logs/qwen3-coder-30b.log" >&2 2>/dev/null || true
+  return 1
+}
+
+open_opencode() {
+  export GEMINI_API_KEY=
+  export OPENCODE_EXPERIMENTAL=1
+
+  if [[ $# -gt 0 && "$1" == "run" ]]; then
+    shift
+    echo "Opening OpenCode run with local Qwen. Qwen will stay running until this command exits." >&2
+    oc run -m "$MODEL_ID" "$@"
+    return $?
+  fi
+
+  echo "Opening OpenCode with local Qwen. Qwen will stay running until OpenCode exits." >&2
+  echo "Use 'ocq --stop' from another terminal if you want the GPU back immediately." >&2
+  oc -m "$MODEL_ID" "$@"
+}
+
+main() {
+  local args=()
+  local ask_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --status)
+        status
+        return 0
+        ;;
+      --stop)
+        stop_server
+        return 0
+        ;;
+      --keep-server|--no-stop)
+        STOP_AFTER=0
+        shift
+        ;;
+      ask)
+        ask_mode=1
+        shift
+        args+=("$@")
+        break
+        ;;
+      --)
+        shift
+        args+=("$@")
+        break
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  start_server
+
+  if [[ "$STOP_AFTER" == "1" && "$STARTED_BY_OCQ" == "1" ]]; then
+    trap 'stop_server >/dev/null 2>&1 || true' EXIT INT TERM
+  fi
+
+  if [[ "$ask_mode" == "1" ]]; then
+    ask_qwen "${args[@]}"
+    return $?
+  fi
+
+  open_opencode "${args[@]}"
+}
+
+main "$@"

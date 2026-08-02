@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  oc-bootstrap
+
+Creates/ensures WALID workflow files exist in the current git repo.
+This is intentionally lightweight: it never overwrites existing files.
+
+Creates (if missing):
+  docs/research.md
+  docs/spec.md
+  docs/gates.md
+  docs/QUESTIONS.md
+  docs/sessions/
+  docs/walid_tasks/
+  docs/walid_runs/
+EOF
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "oc-bootstrap: must run inside a git repo" >&2
+  exit 2
+fi
+
+root=$(git rev-parse --show-toplevel)
+docs="$root/docs"
+
+mkdir -p \
+  "$docs" \
+  "$docs/sessions" \
+  "$docs/walid_tasks" \
+  "$docs/walid_runs"
+
+if [[ ! -f "$docs/research.md" ]]; then
+  cat >"$docs/research.md" <<'EOF'
+# Research
+
+## Context
+
+## Notes
+
+## Links
+
+## Open Questions
+
+EOF
+fi
+
+if [[ ! -f "$docs/spec.md" ]]; then
+  cat >"$docs/spec.md" <<'EOF'
+# Spec
+
+## Goal
+
+## Non-goals
+
+## Constraints
+
+## Approach (high level)
+
+## Acceptance
+
+See `docs/gates.md` for how we verify success.
+
+EOF
+fi
+
+if [[ ! -f "$docs/gates.md" ]]; then
+  cat >"$docs/gates.md" <<'EOF'
+# Gates
+
+These are the commands that prove the task is done.
+
+## Default (fill these in)
+
+- [ ] <cmd>  # e.g. `pytest -q`
+- [ ] <cmd>  # e.g. `npm test`
+
+## Notes
+
+- Keep gates cheap and deterministic.
+- If gates are flaky, rerun winners before selecting them.
+
+EOF
+fi
+
+if [[ ! -f "$docs/QUESTIONS.md" ]]; then
+  ts=$(date +%Y-%m-%d)
+  cat >"$docs/QUESTIONS.md" <<EOF
+# Questions
+
+This file collects async questions for you when running in away/night mode.
+
+## $ts
+
+- 
+
+EOF
+fi
+
+echo "ok: $docs"

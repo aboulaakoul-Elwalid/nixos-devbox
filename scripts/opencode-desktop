@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+APPIMAGE_PATH="/home/elwalid/Applications/opencode-electron-current.AppImage"
+if [[ ! -e "$APPIMAGE_PATH" ]]; then
+  APPIMAGE_PATH="$(ls -1 /home/elwalid/Applications/opencode-electron-*.AppImage 2>/dev/null | sort -V | tail -1)"
+fi
+exec /home/elwalid/.nix-profile/bin/appimage-run "$APPIMAGE_PATH" "$@"

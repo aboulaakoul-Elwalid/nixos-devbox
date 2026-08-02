@@ -1,0 +1,55 @@
+#!/bin/bash
+# Force ensa as the active account everywhere
+
+set -e
+
+ACCOUNTS_FILE=~/.local/share/opencode/codex-accounts.json
+AUTH_FILE=~/.local/share/opencode/auth.json
+CODEX_CLI=~/.codex/auth.json
+
+echo "=== Force Ensa Active ==="
+
+# 1. Get fresh token from codex CLI or accounts
+if [[ -f "$CODEX_CLI" ]]; then
+  EMAIL=$(jq -r '.tokens.access_token' "$CODEX_CLI" | cut -d. -f2 | base64 -d 2>/dev/null | jq -r '."https://api.openai.com/profile".email')
+  if [[ "$EMAIL" == "aboulaakoul.ensa@uhp.ac.ma" ]]; then
+    ACCESS=$(jq -r '.tokens.access_token' "$CODEX_CLI")
+    REFRESH=$(jq -r '.tokens.refresh_token' "$CODEX_CLI")
+    ACCOUNT_ID=$(jq -r '.tokens.account_id' "$CODEX_CLI")
+    EXP=$(echo "$ACCESS" | cut -d. -f2 | base64 -d 2>/dev/null | jq -r '.exp')
+    EXPIRES=$((EXP * 1000))
+    echo "Using fresh tokens from Codex CLI"
+  else
+    echo "Codex CLI has $EMAIL, not ensa. Using accounts file."
+    ACCESS=$(jq -r '.accounts[1].accessToken' "$ACCOUNTS_FILE")
+    REFRESH=$(jq -r '.accounts[1].refreshToken' "$ACCOUNTS_FILE")
+    ACCOUNT_ID=$(jq -r '.accounts[1].accountId' "$ACCOUNTS_FILE")
+    EXPIRES=$(jq -r '.accounts[1].accessExpiresAt' "$ACCOUNTS_FILE")
+  fi
+else
+  ACCESS=$(jq -r '.accounts[1].accessToken' "$ACCOUNTS_FILE")
+  REFRESH=$(jq -r '.accounts[1].refreshToken' "$ACCOUNTS_FILE")
+  ACCOUNT_ID=$(jq -r '.accounts[1].accountId' "$ACCOUNTS_FILE")
+  EXPIRES=$(jq -r '.accounts[1].accessExpiresAt' "$ACCOUNTS_FILE")
+fi
+
+# 2. Update codex-accounts.json
+jq '.activeIndex = 1 | .accounts[1].rateLimitResetTime = null' "$ACCOUNTS_FILE" > /tmp/ca.json && mv /tmp/ca.json "$ACCOUNTS_FILE"
+echo "✅ Set activeIndex=1 in codex-accounts.json"
+
+# 3. Update auth.json (both .openai and .codex)
+jq --arg r "$REFRESH" --arg t "$ACCESS" --arg a "$ACCOUNT_ID" --argjson e "$EXPIRES" \
+  '.openai = {type: "oauth", refresh: $r, access: $t, accountId: $a, expires: $e} | .codex = .openai' \
+  "$AUTH_FILE" > /tmp/auth.json && mv /tmp/auth.json "$AUTH_FILE"
+echo "✅ Updated auth.json (.openai and .codex)"
+
+# 4. Verify
+echo ""
+echo "=== Verification ==="
+OPENAI_EMAIL=$(jq -r '.openai.access' "$AUTH_FILE" | cut -d. -f2 | base64 -d 2>/dev/null | jq -r '."https://api.openai.com/profile".email')
+CODEX_EMAIL=$(jq -r '.codex.access' "$AUTH_FILE" | cut -d. -f2 | base64 -d 2>/dev/null | jq -r '."https://api.openai.com/profile".email')
+echo ".openai: $OPENAI_EMAIL"
+echo ".codex:  $CODEX_EMAIL"
+
+echo ""
+echo "Now restart OpenCode: pkill opencode && opencode"
