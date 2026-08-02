@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dailylog-rollup [YYYY-MM-DD] [--fps N] [--out PATH] [--crf N] [--preset NAME] [--delete-frames|--keep-frames] [--force]
+
+Defaults:
+  - date: today
+  - fps: 4 (each screenshot shows for 0.25s)
+  - out: ~/Videos/daily-logs/YYYY-MM-DD/day.mp4
+  - crf: 28
+  - preset: veryfast
+  - reads loose screens/ and archived screens*.tar.zst frames
+  - delete frames: controlled by DAILYLOG_ROLLUP_DELETE_FRAMES (default: 0)
+EOF
+}
+
+day="$(date +%F)"
+fps="${DAILYLOG_ROLLUP_FPS:-4}"
+crf="${DAILYLOG_ROLLUP_CRF:-28}"
+preset="${DAILYLOG_ROLLUP_PRESET:-veryfast}"
+delete_frames="${DAILYLOG_ROLLUP_DELETE_FRAMES:-0}"
+force=0
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ ${1:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  day="$1"
+  shift
+fi
+
+out="${HOME}/Videos/daily-logs/${day}/day.mp4"
+meta="${HOME}/Videos/daily-logs/${day}/day.json"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fps)
+      fps="${2:-}"; shift 2 ;;
+    --out)
+      out="${2:-}"; shift 2 ;;
+    --crf)
+      crf="${2:-}"; shift 2 ;;
+    --preset)
+      preset="${2:-}"; shift 2 ;;
+    --delete-frames)
+      delete_frames=1; shift ;;
+    --keep-frames)
+      delete_frames=0; shift ;;
+    --force)
+      force=1; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      echo "dailylog-rollup: unknown arg: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "dailylog-rollup: missing 'ffmpeg'" >&2
+  exit 1
+fi
+
+if [[ ! "$fps" =~ ^[0-9]+$ ]] || (( fps <= 0 || fps > 60 )); then
+  echo "dailylog-rollup: invalid --fps $fps" >&2
+  exit 2
+fi
+
+day_dir="${HOME}/Videos/daily-logs/${day}"
+screens_dir="$day_dir/screens"
+if [[ ! -d "$day_dir" ]]; then
+  echo "dailylog-rollup: no day dir: $day_dir" >&2
+  exit 0
+fi
+
+shopt -s nullglob
+loose_files=(
+  "$screens_dir"/*.webp
+  "$screens_dir"/*.jpg
+  "$screens_dir"/*.jpeg
+  "$screens_dir"/*.png
+)
+screen_archives=("$day_dir"/screens*.tar.zst)
+
+if (( ${#loose_files[@]} == 0 && ${#screen_archives[@]} == 0 )); then
+  echo "dailylog-rollup: no loose or archived frames for $day" >&2
+  exit 0
+fi
+
+tmp_list=""
+tmp_root=""
+tmp_out=""
+cleanup() {
+  if [[ -n "$tmp_list" ]]; then
+    rm -f "$tmp_list"
+  fi
+  if [[ -n "$tmp_root" ]]; then
+    rm -rf "$tmp_root"
+  fi
+  if [[ -n "$tmp_out" ]]; then
+    rm -f "$tmp_out"
+  fi
+}
+trap cleanup EXIT
+
+declare -A by_name=()
+for f in "${loose_files[@]}"; do
+  by_name["${f##*/}"]="$f"
+done
+
+if (( ${#screen_archives[@]} > 0 )); then
+  tmp_root="$(mktemp -d -t dailylog-rollup-frames.XXXXXX)"
+  for archive in "${screen_archives[@]}"; do
+    archive_name="${archive##*/}"
+    archive_stem="${archive_name%.tar.zst}"
+    archive_dir="$tmp_root/$archive_stem"
+    mkdir -p "$archive_dir"
+    if ! tar --zstd -xf "$archive" -C "$archive_dir"; then
+      echo "dailylog-rollup: failed to extract archive: $archive" >&2
+      continue
+    fi
+    extracted=(
+      "$archive_dir"/screens/*.webp
+      "$archive_dir"/screens/*.jpg
+      "$archive_dir"/screens/*.jpeg
+      "$archive_dir"/screens/*.png
+    )
+    for f in "${extracted[@]}"; do
+      base="${f##*/}"
+      [[ -n "${by_name[$base]+set}" ]] && continue
+      by_name["$base"]="$f"
+    done
+  done
+fi
+
+if (( ${#by_name[@]} == 0 )); then
+  echo "dailylog-rollup: no usable frames for $day" >&2
+  exit 0
+fi
+
+mapfile -t sorted < <(
+  for name in "${!by_name[@]}"; do
+    printf '%s\t%s\n' "$name" "${by_name[$name]}"
+  done | LC_ALL=C sort | cut -f2-
+)
+
+if [[ -e "$out" ]] && (( force == 0 )); then
+  echo "$out"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$out")"
+
+tmp_list="$(mktemp -t dailylog-rollup.XXXXXX.txt)"
+
+frame_duration="$(awk -v f="$fps" 'BEGIN { printf "%.6f", 1.0 / f }')"
+
+{
+  for ((i=0; i<${#sorted[@]}; i++)); do
+    f="${sorted[$i]}"
+    printf "file '%s'\n" "${f//"'"/"'\\''"}"
+    if (( i < ${#sorted[@]} - 1 )); then
+      printf "duration %s\n" "$frame_duration"
+    fi
+  done
+  printf "file '%s'\n" "${sorted[-1]//"'"/"'\\''"}"
+} >"$tmp_list"
+
+tmp_out="${out%.mp4}.tmp.$$.mp4"
+ffmpeg \
+  -y \
+  -hide_banner -loglevel error \
+  -f concat -safe 0 -i "$tmp_list" \
+  -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" \
+  -c:v libx264 -crf "$crf" -preset "$preset" -pix_fmt yuv420p \
+  -movflags +faststart \
+  "$tmp_out"
+mv "$tmp_out" "$out"
+
+frames_count=${#sorted[@]}
+in_bytes=0
+for f in "${sorted[@]}"; do
+  in_bytes=$(( in_bytes + $(stat -c '%s' "$f" 2>/dev/null || echo 0) ))
+done
+
+out_bytes="$(stat -c '%s' "$out" 2>/dev/null || echo 0)"
+duration_seconds="$(awk -v n="$frames_count" -v f="$fps" 'BEGIN { printf "%.3f", n / f }')"
+
+cat >"$meta" <<EOF
+{
+  "day": "${day}",
+  "screensDir": "${screens_dir}",
+  "output": "${out}",
+  "frames": ${frames_count},
+  "looseFramesAvailable": ${#loose_files[@]},
+  "screenArchivesAvailable": ${#screen_archives[@]},
+  "fps": ${fps},
+  "durationSeconds": ${duration_seconds},
+  "inputBytes": ${in_bytes},
+  "outputBytes": ${out_bytes},
+  "crf": ${crf},
+  "preset": "${preset}",
+  "createdAt": "$(date -Is)"
+}
+EOF
+
+if (( delete_frames == 1 )); then
+  rm -f "${loose_files[@]}"
+fi
+
+echo "$out"

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+day="$(date -d yesterday +%F)"
+exec "$HOME/.local/bin/dailylog-rollup" "$day" --keep-frames

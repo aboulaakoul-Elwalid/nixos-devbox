@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily work logger screenshot capture
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/dailylog-snap
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

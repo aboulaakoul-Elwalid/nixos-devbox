@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly rollup of daily logs
+
+[Timer]
+OnCalendar=*-*-* 00:10:00
+AccuracySec=5min
+RandomizedDelaySec=2min
+Persistent=true
+Unit=dailylog-rollup.service
+
+[Install]
+WantedBy=timers.target

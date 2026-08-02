@@ -31,6 +31,16 @@
     "systemd/user/omarchy-theme-rotate.timer".source = ../files/systemd-user/units/omarchy-theme-rotate.timer;
     "systemd/user/elephant.service".source = ../files/systemd-user/units/elephant.service;
 
+    # Daily-log screenshot capture (every 30s) + nightly rollup into a
+    # timelapse video ($HOME/Videos/daily-logs/YYYY-MM-DD/day.mp4 via
+    # ffmpeg). Pure automation software, no AI/local-model dependency --
+    # that's a separate dailylog-summarize-day script, deliberately not
+    # included since it needs elwalid's personal local-LLM setup.
+    "systemd/user/dailylog-snap.service".source = ../files/systemd-user/units/dailylog-snap.service;
+    "systemd/user/dailylog-snap.timer".source = ../files/systemd-user/units/dailylog-snap.timer;
+    "systemd/user/dailylog-rollup.service".source = ../files/systemd-user/units/dailylog-rollup.service;
+    "systemd/user/dailylog-rollup.timer".source = ../files/systemd-user/units/dailylog-rollup.timer;
+
     # "enabled" symlinks (what `systemctl --user enable` would create) --
     # omarchy-waybar/swaybg/hyprshell get explicitly `systemctl --user
     # start`ed by hypr/autostart.conf regardless, but elephant and all the
@@ -40,6 +50,8 @@
     "systemd/user/timers.target.wants/omarchy-theme-rotate.timer".source = ../files/systemd-user/units/omarchy-theme-rotate.timer;
     "systemd/user/timers.target.wants/hyprshell-watchdog.timer".source = ../files/systemd-user/units/hyprshell-watchdog.timer;
     "systemd/user/graphical-session.target.wants/hyprshell-healthcheck.timer".source = ../files/systemd-user/units/hyprshell-healthcheck.timer;
+    "systemd/user/timers.target.wants/dailylog-snap.timer".source = ../files/systemd-user/units/dailylog-snap.timer;
+    "systemd/user/timers.target.wants/dailylog-rollup.timer".source = ../files/systemd-user/units/dailylog-rollup.timer;
 
     "systemd/scripts/wait-hypr-monitor.sh" = {
       source = ../files/systemd-user/scripts/wait-hypr-monitor.sh;

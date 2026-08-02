@@ -1,0 +1,9 @@
+[Unit]
+Description=Roll up daily screenshots into a video
+
+[Service]
+Type=oneshot
+ExecStart=/run/current-system/sw/bin/flock -n %t/dailylog-rollup.lock %h/.local/bin/dailylog-rollup-yesterday
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

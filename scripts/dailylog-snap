@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+min_free_gb="${DAILYLOG_MIN_FREE_GB:-4}"
+quality="${DAILYLOG_SNAP_QUALITY:-70}"
+format="${DAILYLOG_SNAP_FORMAT:-webp}"
+active_interval="${DAILYLOG_SNAP_ACTIVE_INTERVAL:-30}"
+idle_interval="${DAILYLOG_SNAP_IDLE_INTERVAL:-180}"
+dedupe="${DAILYLOG_DEDUPE:-1}"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/dailylog-snap"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+
+mkdir -p "$state_dir"
+exec 9>"$runtime_dir/dailylog-snap.lock"
+if ! flock -n 9; then
+  exit 0
+fi
+
+if ! command -v grim >/dev/null 2>&1; then
+  echo "dailylog-snap: missing 'grim'" >&2
+  exit 1
+fi
+
+if pgrep -x hyprlock >/dev/null 2>&1; then
+  echo "dailylog-snap: locked; skipping" >&2
+  exit 0
+fi
+
+avail_gb="$(
+  df -BG --output=avail "$HOME" | tail -n 1 | tr -dc '0-9'
+)"
+
+if [[ -n "$avail_gb" ]] && (( avail_gb < min_free_gb )); then
+  echo "dailylog-snap: skip (free ${avail_gb}G < ${min_free_gb}G)" >&2
+  exit 0
+fi
+
+day="$(date +%F)"
+ts="$(date +%H%M%S)"
+iso_ts="$(date -Is)"
+epoch="$(date +%s)"
+day_dir="$HOME/Videos/daily-logs/$day"
+out_dir="$day_dir/screens"
+meta_dir="$day_dir/meta/screens"
+timeline="$day_dir/timeline.jsonl"
+mkdir -p "$out_dir" "$meta_dir"
+
+active_window="$(hyprctl activewindow 2>/dev/null || true)"
+active_workspace="$(hyprctl activeworkspace 2>/dev/null || true)"
+cursor_pos="$(hyprctl cursorpos 2>/dev/null || true)"
+context_hash="$(printf '%s\n%s\n' "$active_window" "$active_workspace" | sha256sum | cut -d' ' -f1)"
+
+last_epoch="$(tr -dc '0-9' <"$state_dir/last_epoch" 2>/dev/null || true)"
+last_epoch="${last_epoch:-0}"
+last_context_hash="$(tr -dc 'a-f0-9' <"$state_dir/last_context_hash" 2>/dev/null || true)"
+last_visual_hash="$(tr -dc 'a-f0-9' <"$state_dir/last_visual_hash" 2>/dev/null || true)"
+age=$(( epoch - last_epoch ))
+
+if [[ "$context_hash" == "$last_context_hash" ]] && (( age >= 0 && age < active_interval )); then
+  exit 0
+fi
+
+case "$format" in
+  webp) out="$out_dir/$ts.webp" ;;
+  jpg|jpeg) out="$out_dir/$ts.jpg" ;;
+  *)
+    echo "dailylog-snap: invalid DAILYLOG_SNAP_FORMAT=$format (use webp|jpg)" >&2
+    exit 2
+    ;;
+esac
+tmp="$out_dir/.$ts.tmp.${out##*.}"
+meta_path="$meta_dir/$ts.json"
+
+if command -v cwebp >/dev/null 2>&1 && [[ "$out" == *.webp ]]; then
+  grim - | cwebp -quiet -q "$quality" -m 6 -o "$tmp" -
+elif command -v magick >/dev/null 2>&1; then
+  grim - | magick png:- -strip -quality "$quality" "$tmp"
+else
+  echo "dailylog-snap: missing encoder ('cwebp' or 'magick')" >&2
+  exit 1
+fi
+
+file_sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+bytes="$(stat -c '%s' "$tmp" 2>/dev/null || echo 0)"
+visual_hash="$file_sha"
+if command -v magick >/dev/null 2>&1; then
+  visual_hash="$(magick "$tmp" -resize '16x9!' -colorspace Gray -posterize 8 -depth 8 gray:- 2>/dev/null | sha256sum | cut -d' ' -f1 || printf '%s' "$file_sha")"
+fi
+
+reason="changed"
+if [[ "$context_hash" == "$last_context_hash" ]]; then
+  reason="interval"
+fi
+
+if [[ "$dedupe" != "0" ]] \
+  && [[ "$visual_hash" == "$last_visual_hash" ]] \
+  && [[ "$context_hash" == "$last_context_hash" ]] \
+  && (( age >= 0 && age < idle_interval )); then
+  rm -f "$tmp"
+  exit 0
+fi
+
+if [[ "$visual_hash" == "$last_visual_hash" ]] && [[ "$context_hash" == "$last_context_hash" ]]; then
+  reason="idle-anchor"
+fi
+
+mv "$tmp" "$out"
+
+export DAILYLOG_TS="$iso_ts"
+export DAILYLOG_EPOCH="$epoch"
+export DAILYLOG_SCREENSHOT="$out"
+export DAILYLOG_META="$meta_path"
+export DAILYLOG_TIMELINE="$timeline"
+export DAILYLOG_BYTES="$bytes"
+export DAILYLOG_SHA256="$file_sha"
+export DAILYLOG_VISUAL_HASH="$visual_hash"
+export DAILYLOG_CONTEXT_HASH="$context_hash"
+export DAILYLOG_REASON="$reason"
+export DAILYLOG_FORMAT="$format"
+export DAILYLOG_QUALITY="$quality"
+export DAILYLOG_ACTIVE_WINDOW="$active_window"
+export DAILYLOG_ACTIVE_WORKSPACE="$active_workspace"
+export DAILYLOG_CURSOR_POS="$cursor_pos"
+
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+entry = {
+    "timestamp": os.environ["DAILYLOG_TS"],
+    "epoch": int(os.environ["DAILYLOG_EPOCH"]),
+    "type": "screenshot",
+    "reason": os.environ["DAILYLOG_REASON"],
+    "path": os.environ["DAILYLOG_SCREENSHOT"],
+    "bytes": int(os.environ["DAILYLOG_BYTES"]),
+    "sha256": os.environ["DAILYLOG_SHA256"],
+    "visualHash": os.environ["DAILYLOG_VISUAL_HASH"],
+    "contextHash": os.environ["DAILYLOG_CONTEXT_HASH"],
+    "format": os.environ["DAILYLOG_FORMAT"],
+    "quality": int(os.environ["DAILYLOG_QUALITY"]),
+    "activeWindow": os.environ.get("DAILYLOG_ACTIVE_WINDOW", ""),
+    "activeWorkspace": os.environ.get("DAILYLOG_ACTIVE_WORKSPACE", ""),
+    "cursor": os.environ.get("DAILYLOG_CURSOR_POS", ""),
+}
+
+Path(os.environ["DAILYLOG_META"]).write_text(json.dumps(entry, indent=2) + "\n")
+with Path(os.environ["DAILYLOG_TIMELINE"]).open("a") as fh:
+    fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+PY
+
+printf '%s' "$epoch" >"$state_dir/last_epoch"
+printf '%s' "$context_hash" >"$state_dir/last_context_hash"
+printf '%s' "$visual_hash" >"$state_dir/last_visual_hash"
+printf '%s\n' "$out" >"$state_dir/last_path"
+
+echo "$out"

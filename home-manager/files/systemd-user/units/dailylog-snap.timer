@@ -1,0 +1,13 @@
+[Unit]
+Description=Run dailylog-snap periodically
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=3s
+Persistent=true
+Unit=dailylog-snap.service
+
+[Install]
+WantedBy=timers.target
