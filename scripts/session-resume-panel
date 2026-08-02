@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+index="$HOME/.local/state/session-resume/index.json"
+if [[ ! -s "$index" ]]; then
+  "$HOME/.local/bin/session-resume-index" >/dev/null
+fi
+
+if [[ "${1:-}" == "--print" ]]; then
+  jq -r '
+    "Current windows:",
+    (.windows[:10][]? | "- " + ((.class // "?") + ": " + (.title // ""))),
+    "",
+    "Recent digests:",
+    (.recent_digests[]? | "- " + .),
+    "",
+    "OpenCode restore artifacts:",
+    (.opencode_sessions[:10][]? | "- " + .path)
+  ' "$index"
+  exit 0
+fi
+
+choice="$({
+  printf 'Rebuild session index\n'
+  jq -r '.recent_digests[]? | "Open digest: " + .' "$index"
+  jq -r '.opencode_sessions[:10][]? | "OpenCode artifact: " + .path' "$index"
+} | walker --dmenu --placeholder 'Resume session')"
+
+case "$choice" in
+  "Rebuild session index") "$HOME/.local/bin/session-resume-index" ;;
+  "Open digest: "*) xdg-open "${choice#Open digest: }" ;;
+  *) printf '%s\n' "$choice" ;;
+esac

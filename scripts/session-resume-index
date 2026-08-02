@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+OUT = HOME / ".local/state/session-resume/index.json"
+
+
+def run_json(cmd, timeout=5):
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def read_lines(path, limit=20):
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+        return lines[-limit:]
+    except Exception:
+        return []
+
+
+def main():
+    clients = run_json(["hyprctl", "clients", "-j"]) or []
+    opencode_restore = HOME / ".local/state/opencode/restore"
+    opencode_sessions = []
+    if opencode_restore.exists():
+        for p in sorted(opencode_restore.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True)[:20]:
+            if p.name.endswith(".lock"):
+                continue
+            opencode_sessions.append({"path": str(p), "mtime": int(p.stat().st_mtime)})
+
+    today = datetime.now().date().isoformat()
+    yesterday_digest = sorted((HOME / "Videos/daily-logs").glob("*/summary.md"), reverse=True)[:5]
+
+    doc = {
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "windows": [
+            {
+                "class": c.get("class"),
+                "title": c.get("title"),
+                "workspace": (c.get("workspace") or {}).get("name"),
+            }
+            for c in clients
+        ],
+        "closed_windows": read_lines(HOME / ".cache/hypr-closed-windows.stack", 20),
+        "opencode_sessions": opencode_sessions,
+        "recent_digests": [str(p) for p in yesterday_digest],
+        "today_digest": str(HOME / "Videos/daily-logs" / today / "summary.md"),
+    }
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(doc, indent=2) + "\n")
+    print(OUT)
+
+
+if __name__ == "__main__":
+    main()
