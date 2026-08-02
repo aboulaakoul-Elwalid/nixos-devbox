@@ -38,6 +38,17 @@
     recursive = true;
   };
 
+  # Templates omarchy-theme-set-templates uses to generate each theme's
+  # per-app files (hyprland.conf, waybar.css, mako.ini, etc.) from its
+  # colors.toml -- themes that don't ship these as static files (nord is one)
+  # rely on this entirely. Missing this made `omarchy-theme-set nord` (and
+  # any other template-only theme) fail with "incomplete, aborting swap",
+  # leaving current/theme/ empty and waybar crash-looping.
+  xdg.dataFile."omarchy/default/themed" = {
+    source = ../files/omarchy-default/themed;
+    recursive = true;
+  };
+
   # Elephant (walker's search backend) loads menu providers as Lua files
   # from ~/.config/elephant/menus/ -- it does NOT scan
   # ~/.local/share/omarchy/default/elephant/ on its own. On the source
