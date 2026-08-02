@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prefer the managed user service to avoid duplicate bars.
+if systemctl --user restart omarchy-waybar.service >/dev/null 2>&1; then
+  exit 0
+fi
+
+omarchy-restart-app waybar

@@ -22,4 +22,19 @@
     source = ../files/omarchy-default/mako;
     recursive = true;
   };
+  # The actual omarchy-* CLI implementations (omarchy-menu, omarchy-theme-set,
+  # omarchy-launch-*, etc, ~190 scripts, 860K). scripts/omarchy-menu and
+  # several others exec into here -- e.g. `SUPER+SPACE` was silently doing
+  # nothing because this whole directory never existed. Some scripts here are
+  # Arch-specific (AUR, pacman, limine bootloader) and simply won't work on
+  # NixOS -- harmless if unused, same as other excluded-tool references.
+  xdg.dataFile."omarchy/bin" = {
+    source = ../files/omarchy-default/bin;
+    recursive = true;
+  };
+  # walker's config.toml points theme = "omarchy-default" at this location.
+  xdg.dataFile."omarchy/default/walker" = {
+    source = ../files/omarchy-default/walker;
+    recursive = true;
+  };
 }

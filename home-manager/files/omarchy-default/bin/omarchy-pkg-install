@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+# Show a fuzzy-finder TUI for picking new Arch and OPR packages to install.
+export PATH="$HOME/.local/share/omarchy/bin:$PATH"
+
+if ! command -v pacman >/dev/null 2>&1; then
+  cache_dir="$HOME/.cache/omarchy"
+  cache_file="$cache_dir/nixpkgs-packages.tsv"
+  mkdir -p "$cache_dir"
+
+  # Build or refresh package index weekly for fast Omarchy-like picker UX.
+  if [[ ! -s "$cache_file" ]] || find "$cache_file" -mtime +7 | grep -q .; then
+    tmp_file="$(mktemp)"
+    if ! nix-env -f '<nixpkgs>' -qaP --description '*' 2>/dev/null | awk '{attr=$1; $1=""; sub(/^ +/,""); print attr "\t" $0}' >"$tmp_file"; then
+      rm -f "$tmp_file"
+      echo "Failed to build nixpkgs package index."
+      exit 1
+    fi
+    mv "$tmp_file" "$cache_file"
+  fi
+
+  fzf_args=(
+    --multi
+    --delimiter $'\t'
+    --with-nth=1,2
+    --nth=1
+    --exact
+    --algo=v2
+    --tiebreak=begin,length,index
+    --preview 'echo {} | cut -f2-'
+    --preview-label='description'
+    --preview-label-pos='bottom'
+    --preview-window 'down:65%:wrap'
+    --bind 'alt-p:toggle-preview'
+    --bind 'alt-d:preview-half-page-down,alt-u:preview-half-page-up'
+    --bind 'alt-k:preview-up,alt-j:preview-down'
+    --bind 'ctrl-d:change-nth(1,2)'
+    --color 'pointer:green,marker:green'
+  )
+
+  selections=$(cat "$cache_file" | fzf "${fzf_args[@]}") || exit 0
+  pkg_names=$(echo "$selections" | cut -f1 | tr '\n' ' ')
+
+  if [[ -n ${pkg_names// } ]]; then
+    omarchy-pkg-add $pkg_names || exit 1
+    omarchy-show-done
+  fi
+  exit 0
+fi
+
+fzf_args=(
+  --multi
+  --preview 'pacman -Sii {1}'
+  --preview-label='alt-p: toggle description, alt-j/k: scroll, tab: multi-select'
+  --preview-label-pos='bottom'
+  --preview-window 'down:65%:wrap'
+  --bind 'alt-p:toggle-preview'
+  --bind 'alt-d:preview-half-page-down,alt-u:preview-half-page-up'
+  --bind 'alt-k:preview-up,alt-j:preview-down'
+  --color 'pointer:green,marker:green'
+)
+
+pkg_names=$(pacman -Slq | fzf "${fzf_args[@]}")
+
+if [[ -n $pkg_names ]]; then
+  # Convert newline-separated selections to space-separated for yay
+  echo "$pkg_names" | tr '\n' ' ' | xargs sudo pacman -S --noconfirm
+  omarchy-show-done
+fi

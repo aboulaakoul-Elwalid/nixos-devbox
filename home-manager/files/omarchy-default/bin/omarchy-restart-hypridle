@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+# Restart the hypridle service (used for idle detection and auto-lock).
+
+omarchy-restart-app hypridle

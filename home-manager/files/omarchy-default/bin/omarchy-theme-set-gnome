@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CURRENT_THEME_DIR="$HOME/.config/omarchy/current/theme"
+GNOME_ICONS_THEME="$CURRENT_THEME_DIR/icons.theme"
+
+is_light=false
+if [[ -f "$CURRENT_THEME_DIR/light.mode" ]]; then
+  is_light=true
+fi
+
+gtk_theme="Adwaita-dark"
+if $is_light; then
+  gtk_theme="Adwaita"
+fi
+
+icon_theme="Yaru-blue"
+if [[ -f "$GNOME_ICONS_THEME" ]]; then
+  icon_theme="$(<"$GNOME_ICONS_THEME")"
+fi
+
+# Apply via gsettings when available.
+if command -v gsettings >/dev/null 2>&1; then
+  if $is_light; then
+    gsettings set org.gnome.desktop.interface color-scheme "prefer-light" || true
+  else
+    gsettings set org.gnome.desktop.interface color-scheme "prefer-dark" || true
+  fi
+  gsettings set org.gnome.desktop.interface gtk-theme "$gtk_theme" || true
+  gsettings set org.gnome.desktop.interface icon-theme "$icon_theme" || true
+fi
+
+# Also update GTK settings files directly for non-GNOME sessions.
+for cfg in "$HOME/.config/gtk-3.0/settings.ini" "$HOME/.config/gtk-4.0/settings.ini"; do
+  mkdir -p "$(dirname "$cfg")"
+  [[ -f "$cfg" ]] || printf "[Settings]\n" >"$cfg"
+
+  if grep -q '^gtk-theme-name=' "$cfg"; then
+    sed -i "s/^gtk-theme-name=.*/gtk-theme-name=$gtk_theme/" "$cfg"
+  else
+    printf "gtk-theme-name=%s\n" "$gtk_theme" >>"$cfg"
+  fi
+
+  if grep -q '^gtk-icon-theme-name=' "$cfg"; then
+    sed -i "s/^gtk-icon-theme-name=.*/gtk-icon-theme-name=$icon_theme/" "$cfg"
+  else
+    printf "gtk-icon-theme-name=%s\n" "$icon_theme" >>"$cfg"
+  fi
+done

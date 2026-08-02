@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+# Add the named packages to the system from the AUR if they're missing. Returns false if it couldn't be done.
+export PATH="$HOME/.local/share/omarchy/bin:$PATH"
+
+if ! command -v yay >/dev/null 2>&1 || ! command -v pacman >/dev/null 2>&1; then
+  echo "AUR install is Arch-only. On NixOS use nixpkgs, Flatpak, or Distrobox." >&2
+  exit 1
+fi
+
+if omarchy-pkg-missing "$@"; then
+  yay -S --noconfirm --needed "$@" || exit 1
+fi
+
+for pkg in "$@"; do
+  # Secondary check to handle states where pacman doesn't actually register an error
+  if ! pacman -Q "$pkg" &>/dev/null; then
+    echo -e "\033[31mError: Package '$pkg' did not install\033[0m" >&2
+    exit 1
+  fi
+done
+
+exit 0

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+
+if [[ -z "${1:-}" ]]; then
+  echo "Usage: omarchy-theme-set <theme-name>"
+  exit 1
+fi
+
+CURRENT_THEME_PATH="$HOME/.config/omarchy/current/theme"
+NEXT_THEME_PATH="$HOME/.config/omarchy/current/next-theme"
+USER_THEMES_PATH="$HOME/.config/omarchy/themes"
+OMARCHY_THEMES_PATH="$OMARCHY_PATH/themes"
+LOCK_DIR="$HOME/.config/omarchy/current/.theme-set.lock.d"
+
+THEME_NAME=$(echo "$1" | sed -E 's/<[^>]+>//g' | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+
+copy_theme_overlay() {
+  local src="$1"
+  local dst="$2"
+  if [[ -d "$src" ]]; then
+    cp -a "$src"/. "$dst"/
+  fi
+}
+
+run_optional() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 8 "$@" >/dev/null 2>&1 || true
+  else
+    "$@" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_required_files() {
+  local base="$1"
+  local missing=0
+  for f in hyprland.conf ghostty.conf waybar.css kitty.conf mako.ini; do
+    if [[ ! -f "$base/$f" ]]; then
+      missing=1
+      if [[ -f "$CURRENT_THEME_PATH/$f" ]]; then
+        cp -a "$CURRENT_THEME_PATH/$f" "$base/$f"
+      fi
+    fi
+  done
+  if (( missing )); then
+    omarchy-theme-set-templates || true
+  fi
+  for f in hyprland.conf ghostty.conf waybar.css kitty.conf mako.ini; do
+    if [[ ! -f "$base/$f" ]]; then
+      echo "Theme '$THEME_NAME' is incomplete (missing $f), aborting swap to keep current theme safe."
+      return 1
+    fi
+  done
+}
+
+if [[ ! -d "$OMARCHY_THEMES_PATH/$THEME_NAME" ]] && [[ ! -d "$USER_THEMES_PATH/$THEME_NAME" ]]; then
+  echo "Theme '$THEME_NAME' does not exist"
+  exit 1
+fi
+
+mkdir -p "$(dirname "$LOCK_DIR")"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  now="$(date +%s)"
+  old="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)"
+  # Auto-clear stale lock dirs from interrupted theme switches.
+  if (( now - old > 30 )); then
+    rm -rf "$LOCK_DIR" || true
+    mkdir "$LOCK_DIR" 2>/dev/null || { echo "Theme switch is already running, try again."; exit 1; }
+  else
+    echo "Theme switch is already running, try again."
+    exit 1
+  fi
+fi
+trap 'rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
+
+rm -rf "$NEXT_THEME_PATH"
+mkdir -p "$NEXT_THEME_PATH"
+
+# Copy official theme first, then overlay user customizations on top.
+copy_theme_overlay "$OMARCHY_THEMES_PATH/$THEME_NAME" "$NEXT_THEME_PATH"
+copy_theme_overlay "$USER_THEMES_PATH/$THEME_NAME" "$NEXT_THEME_PATH"
+
+# Generate dynamic configs from colors.toml templates.
+omarchy-theme-set-templates
+
+# Fail safe: never replace current theme with an incomplete one.
+ensure_required_files "$NEXT_THEME_PATH"
+
+# Swap next theme into current without removing current first.
+mkdir -p "$CURRENT_THEME_PATH"
+rsync -a --delete "$NEXT_THEME_PATH/" "$CURRENT_THEME_PATH/"
+rm -rf "$NEXT_THEME_PATH"
+
+# Store theme name for reference.
+echo "$THEME_NAME" >"$HOME/.config/omarchy/current/theme.name"
+
+# Release lock before optional/restart actions to avoid a stuck lock when
+# desktop-specific commands block or fail.
+rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true
+trap - EXIT
+
+# Apply and refresh (best-effort).
+run_optional omarchy-theme-bg-next
+run_optional omarchy-restart-waybar
+run_optional omarchy-restart-swayosd
+run_optional omarchy-restart-terminal
+run_optional omarchy-restart-hyprctl
+run_optional omarchy-restart-btop
+run_optional omarchy-restart-opencode
+run_optional omarchy-restart-mako
+run_optional omarchy-theme-set-gnome
+run_optional omarchy-theme-set-browser
+run_optional omarchy-theme-set-vscode
+run_optional omarchy-theme-set-obsidian
+run_optional omarchy-theme-set-keyboard
+run_optional omarchy-hook theme-set "$THEME_NAME"

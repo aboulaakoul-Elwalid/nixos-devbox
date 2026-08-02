@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+# Reload opencode configuration (used by the Omarchy theme switching).
+
+CURRENT_THEME="$HOME/.config/omarchy/current/theme"
+
+# Copy the generated theme to opencode themes directory
+if [[ -f "$CURRENT_THEME/opencode.theme.json" ]]; then
+  mkdir -p "$HOME/.config/opencode/themes"
+  cp "$CURRENT_THEME/opencode.theme.json" "$HOME/.config/opencode/themes/omarchy.json"
+fi
+
+# Signal opencode to reload if running
+if pgrep -x opencode >/dev/null; then
+  killall -SIGUSR2 opencode
+fi

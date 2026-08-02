@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+# Launch a floating terminal with the Omarchy logo presentation, then execute the command passed in, and finally end with the omarchy-show-done presentation.
+# Used by actions such as Update System.
+
+cmd="$*"
+export PATH="$HOME/.local/share/omarchy/bin:$HOME/.local/bin:$PATH"
+exec setsid uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.terminal --title=Omarchy -e bash -lc "export PATH=\"$HOME/.local/share/omarchy/bin:$HOME/.local/bin:\$PATH\"; omarchy-show-logo; $cmd; if (( \$? != 130 )); then omarchy-show-done; fi"

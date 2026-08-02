@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+# Unblock and restart the bluetooth service.
+
+echo -e "Unblocking bluetooth...\n"
+rfkill unblock bluetooth
+rfkill list bluetooth

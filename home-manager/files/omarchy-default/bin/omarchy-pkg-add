@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+# Add the named packages to the system if they're missing. Returns false if it couldn't be done.
+export PATH="$HOME/.local/share/omarchy/bin:$PATH"
+
+if command -v pacman >/dev/null 2>&1; then
+  if omarchy-pkg-missing "$@"; then
+    sudo pacman -S --noconfirm --needed "$@" || exit 1
+  fi
+
+  for pkg in "$@"; do
+    # Secondary check to handle states where pacman doesn't actually register an error
+    if ! pacman -Q "$pkg" &>/dev/null; then
+      echo -e "\033[31mError: Package '$pkg' did not install\033[0m" >&2
+      exit 1
+    fi
+  done
+
+  exit 0
+fi
+
+if ! command -v nix >/dev/null 2>&1; then
+  echo -e "\033[31mError: neither pacman nor nix is available\033[0m" >&2
+  exit 1
+fi
+
+map_pkg_for_nixos() {
+  case "$1" in
+  bitwarden) echo "bitwarden-desktop" ;;
+  cursor-bin) echo "cursor-cli" ;;
+  emacs-wayland) echo "emacs" ;;
+  sublime-text-4) echo "sublime4" ;;
+  openai-codex) echo "codex" ;;
+  *) echo "$1" ;;
+  esac
+}
+
+for pkg in "$@"; do
+  nix_pkg="$(map_pkg_for_nixos "$pkg")"
+
+  if nix profile list --json 2>/dev/null | jq -e --arg p "$nix_pkg" '.elements | has($p)' >/dev/null 2>&1; then
+    continue
+  fi
+
+  echo "Installing nixpkgs#$nix_pkg ..."
+  if ! nix profile install --impure "nixpkgs#$nix_pkg"; then
+    echo -e "\033[31mError: nixpkgs package '$nix_pkg' was not found or failed to install\033[0m" >&2
+    exit 1
+  fi
+done
+
+exit 0

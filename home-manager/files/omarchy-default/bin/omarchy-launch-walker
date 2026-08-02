@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+
+# Launch Walker while preferring the managed elephant.service on NixOS.
+set -euo pipefail
+export GDK_BACKEND="${GDK_BACKEND:-wayland}"
+
+if systemctl --user is-enabled elephant.service >/dev/null 2>&1; then
+  systemctl --user is-active elephant.service >/dev/null 2>&1 || systemctl --user start elephant.service
+else
+  if ! pgrep -f '/elephant($| )' >/dev/null; then
+    setsid uwsm-app -- elephant &
+    sleep 0.1
+  fi
+fi
+
+# Service mode has been unstable in this migrated setup; use direct-launch walker per invocation.
+# Kill stale service instance if present.
+pkill -f "walker --gapplication-service" >/dev/null 2>&1 || true
+
+extra=()
+if [[ " $* " != *" --width "* ]]; then
+  extra+=(--width 644)
+fi
+if [[ " $* " != *" --minheight "* && " $* " != *" --height "* ]]; then
+  extra+=(--minheight 300)
+fi
+if [[ " $* " != *" --maxheight "* && " $* " != *" --height "* ]]; then
+  extra+=(--maxheight 300)
+fi
+
+exec walker "${extra[@]}" "$@"

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+# Restart an application by killing it and relaunching via uwsm.
+# Usage: omarchy-restart-app <application-name> [application-args...]
+
+set -euo pipefail
+app="$1"
+shift || true
+
+# Handle wrapped process names on NixOS (e.g. .waybar-wrapped, .ghostty-wrapped).
+ps -eo pid=,comm=,args= | awk -v a="$app" '
+  $2 ~ a || $3 ~ ("/" a "($| )") { print $1 }
+' | while read -r pid; do
+  kill "$pid" >/dev/null 2>&1 || true
+done
+
+if [[ $# -gt 0 ]]; then
+  setsid uwsm-app -- "$app" "$@" >/dev/null 2>&1 &
+else
+  setsid uwsm-app -- "$app" >/dev/null 2>&1 &
+fi

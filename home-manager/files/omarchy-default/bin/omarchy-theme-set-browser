@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+CHROMIUM_THEME=~/.config/omarchy/current/theme/chromium.theme
+
+if omarchy-cmd-present chromium || omarchy-cmd-present brave; then
+  if [[ -f $CHROMIUM_THEME ]]; then
+    THEME_RGB_COLOR=$(<$CHROMIUM_THEME)
+    THEME_HEX_COLOR=$(printf '#%02x%02x%02x' ${THEME_RGB_COLOR//,/ })
+  else
+    # Use a default, neutral grey if theme doesn't have a color
+    THEME_RGB_COLOR="28,32,39"
+    THEME_HEX_COLOR="#1c2027"
+  fi
+
+  if omarchy-cmd-present chromium; then
+    # System policy path (requires root on NixOS/most distros).
+    if [[ -w /etc/chromium/policies/managed || ! -e /etc/chromium/policies/managed ]]; then
+      mkdir -p /etc/chromium/policies/managed 2>/dev/null || true
+      echo "{\"BrowserThemeColor\": \"$THEME_HEX_COLOR\"}" | tee "/etc/chromium/policies/managed/color.json" >/dev/null 2>&1 || true
+    fi
+    # User fallback path (best effort; works on some builds).
+    mkdir -p "$HOME/.config/chromium/policies/managed" 2>/dev/null || true
+    echo "{\"BrowserThemeColor\": \"$THEME_HEX_COLOR\"}" >"$HOME/.config/chromium/policies/managed/color.json" 2>/dev/null || true
+    chromium --refresh-platform-policy --no-startup-window >/dev/null 2>&1 || true
+  fi
+
+  if omarchy-cmd-present brave; then
+    # System policy path (requires root on NixOS/most distros).
+    if [[ -w /etc/brave/policies/managed || ! -e /etc/brave/policies/managed ]]; then
+      mkdir -p /etc/brave/policies/managed 2>/dev/null || true
+      echo "{\"BrowserThemeColor\": \"$THEME_HEX_COLOR\"}" | tee "/etc/brave/policies/managed/color.json" >/dev/null 2>&1 || true
+    fi
+    # User fallback path (best effort; works on some builds).
+    mkdir -p "$HOME/.config/BraveSoftware/Brave-Browser/policies/managed" 2>/dev/null || true
+    echo "{\"BrowserThemeColor\": \"$THEME_HEX_COLOR\"}" >"$HOME/.config/BraveSoftware/Brave-Browser/policies/managed/color.json" 2>/dev/null || true
+    brave --refresh-platform-policy --no-startup-window >/dev/null 2>&1 || true
+  fi
+fi

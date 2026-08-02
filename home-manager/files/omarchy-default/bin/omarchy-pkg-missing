@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+# Returns true if any of the named packages are missing from the system (or false if they're all there).
+export PATH="$HOME/.local/share/omarchy/bin:$PATH"
+
+if command -v pacman >/dev/null 2>&1; then
+  for pkg in "$@"; do
+    if ! pacman -Q "$pkg" &>/dev/null; then
+      exit 0
+    fi
+  done
+
+  exit 1
+fi
+
+if command -v nix >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+  profile_json=$(nix profile list --json 2>/dev/null || echo '{"elements":{}}')
+
+  for pkg in "$@"; do
+    if ! jq -e --arg p "$pkg" '.elements | has($p)' >/dev/null 2>&1 <<<"$profile_json"; then
+      exit 0
+    fi
+  done
+
+  exit 1
+fi
+
+exit 0
