@@ -17,4 +17,9 @@
     source = ../files/omarchy-default/hypr;
     recursive = true;
   };
+  # mako's active theme config does `include=~/.local/share/omarchy/default/mako/core.ini`
+  xdg.dataFile."omarchy/default/mako" = {
+    source = ../files/omarchy-default/mako;
+    recursive = true;
+  };
 }

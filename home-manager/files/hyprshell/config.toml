@@ -1,0 +1,13 @@
+version = 3
+
+[windows]
+scale = 8.0
+items_per_row = 5
+
+# Keep a switch mode enabled so the daemon stays running, but bind it to ALT.
+# SUPER+TAB is handled from Hyprland binds (bindings.conf) via
+# ~/.local/bin/hyprshell-keybind for deterministic behavior.
+[windows.switch]
+modifier = "Super"
+switch_workspaces = true
+filter_by = []

@@ -13,6 +13,8 @@
     ./modules/tools.nix
     ./modules/systemd-user-services.nix
     ./modules/omarchy-default.nix
+    ./modules/hyprshell.nix
+    ./modules/oh-my-zsh.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the
