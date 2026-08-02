@@ -591,6 +591,14 @@ in
   };
 
   omanix.enable = true;
+
+  # home-manager's default behavior is to abort the ENTIRE activation the
+  # first time it tries to manage a path some app already auto-created
+  # (GTK/qalculate/etc. writing their own settings file on first launch) --
+  # hit this repeatedly deploying to a machine that already had apps
+  # running. Back up and replace instead of refusing outright.
+  home-manager.backupFileExtension = "hm-bak";
+
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   services.keyd = {
     enable = true;
