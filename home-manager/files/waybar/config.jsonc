@@ -65,16 +65,16 @@
   // AI Credits Dashboard
   "custom/ai-credits": {
     "format": "{}",
-    "exec": "/home/elwalid/.config/waybar/scripts/ai-credits-safe.sh",
+    "exec": "$HOME/.config/waybar/scripts/ai-credits-safe.sh",
     "interval": 120,
     "return-type": "json",
-    "on-click": "/home/elwalid/.local/bin/ai-credits-popup"
+    "on-click": "$HOME/.local/bin/ai-credits-popup"
   },
 
   // ActivityWatch
   "custom/activitywatch": {
     "format": "{}",
-    "exec": "/home/elwalid/.config/waybar/scripts/activitywatch-safe.sh",
+    "exec": "$HOME/.config/waybar/scripts/activitywatch-safe.sh",
     "interval": 60,
     "return-type": "json",
     "on-click": "xdg-open http://localhost:5600"
@@ -119,7 +119,7 @@
   // GPU
   "custom/gpu": {
     "format": "{}",
-    "exec": "/home/elwalid/.config/waybar/scripts/gpu-safe.sh",
+    "exec": "$HOME/.config/waybar/scripts/gpu-safe.sh",
     "interval": 5,
     "return-type": "json"
   },

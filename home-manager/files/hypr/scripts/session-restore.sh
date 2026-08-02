@@ -80,7 +80,7 @@ main() {
     launch_if_missing "Obsidian" 'any(.[]; ((.class // "") == "obsidian" or (.initialClass // "") == "obsidian" or (((.class // "") == "electron" or (.initialClass // "") == "electron") and ((((.title // "") | test(" - Obsidian")) or ((.initialTitle // "") | test(" - Obsidian")))))))' uwsm-app -- obsidian -disable-gpu --enable-wayland-ime
     launch_if_missing "Zed" 'any(.[]; (.class // "") == "dev.zed.Zed" or (.initialClass // "") == "dev.zed.Zed")' uwsm-app -- zed
 
-    if ! /home/elwalid/.config/hypr/scripts/opencode-session-restore.sh >/dev/null 2>&1; then
+    if ! $HOME/.config/hypr/scripts/opencode-session-restore.sh >/dev/null 2>&1; then
         log "WARN: OpenCode session restore failed"
     fi
 

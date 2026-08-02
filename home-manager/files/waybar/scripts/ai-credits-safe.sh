@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TOKSCALE="/home/elwalid/.cache/.bun/bin/tokscale"
-CACHE_DIR="${XDG_CACHE_HOME:-/home/elwalid/.cache}/waybar"
+TOKSCALE="$HOME/.cache/.bun/bin/tokscale"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/waybar"
 CACHE_FILE="$CACHE_DIR/tokens-today.json"
 LOCK_FILE="$CACHE_DIR/tokens-today.lock"
 CACHE_TTL_SECONDS=3600
@@ -65,7 +65,7 @@ if [[ -s "$CACHE_FILE" ]]; then
   fi
 fi
 
-if out=$(/home/elwalid/.local/bin/ai-credits-waybar 2>/dev/null); then
+if out=$($HOME/.local/bin/ai-credits-waybar 2>/dev/null); then
   if jq -e . >/dev/null 2>&1 <<<"$out"; then
     jq -c --arg tokens "$tokens_text" --arg tokstt "$tokens_tooltip" '
       .text = (" " + ((((.text | tostring | split(" C "))[1]) // "?") | sub("^ +"; "")) + " · " + $tokens) |

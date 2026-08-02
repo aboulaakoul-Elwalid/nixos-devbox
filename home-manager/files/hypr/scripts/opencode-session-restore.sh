@@ -98,7 +98,7 @@ main() {
 
     log "Reopening session: $session_id"
     OPENCODE_RESTORE_INSTANCE="$instance" OPENCODE_RESTORE_DIRECTORY="$directory" \
-      uwsm-app -- /run/current-system/sw/bin/kitty --title "OpenCode::${instance}" --directory "$directory" /home/elwalid/.local/bin/oc --session "$session_id" >/dev/null 2>&1 &
+      uwsm-app -- /run/current-system/sw/bin/kitty --title "OpenCode::${instance}" --directory "$directory" $HOME/.local/bin/oc --session "$session_id" >/dev/null 2>&1 &
     seen_ids[$session_id]=1
     restored=$((restored + 1))
     sleep 0.75
