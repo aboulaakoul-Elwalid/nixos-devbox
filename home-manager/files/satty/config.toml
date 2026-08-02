@@ -1,0 +1,7 @@
+[general]
+early-exit = true
+save-after-copy = true
+copy-command = "wl-copy --type image/png"
+actions-on-enter = ["save-to-file", "save-to-clipboard", "exit"]
+actions-on-right-click = ["save-to-file", "save-to-clipboard", "exit"]
+actions-on-escape = ["exit"]

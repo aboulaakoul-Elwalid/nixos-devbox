@@ -16,6 +16,7 @@
     ./modules/hyprshell.nix
     ./modules/oh-my-zsh.nix
     ./modules/npm.nix
+    ./modules/satty-swayosd.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the
