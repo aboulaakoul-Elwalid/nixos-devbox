@@ -12,6 +12,7 @@
     ./modules/theme.nix
     ./modules/tools.nix
     ./modules/systemd-user-services.nix
+    ./modules/omarchy-default.nix
   ];
 
   # --- CHANGE THIS: these two values are specific to elwalid's account on the

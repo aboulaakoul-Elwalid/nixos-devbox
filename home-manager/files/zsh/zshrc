@@ -770,7 +770,7 @@ export PATH="$HOME/.local/bin:$PATH"
 if [ -f "$HOME/.config/cloudflare/env" ]; then
   source "$HOME/.config/cloudflare/env"
 fi
-DISCORD_TOKEN=<SET-YOUR-OWN-VALUE>
+DISCORD_TOKEN="SET-YOUR-OWN-VALUE"
 
 # >>> grok installer >>>
 export PATH="$HOME/.grok/bin:$PATH"
