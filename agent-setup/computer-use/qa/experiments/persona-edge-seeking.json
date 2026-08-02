@@ -1,0 +1,128 @@
+{
+  "url": "http://127.0.0.1:8940",
+  "persona": "You are a real person using a small web app to jot down quick notes, but your notes are messy and varied: you use contractions, quotes, names with possessives, symbols, punctuation and occasionally very short or very long text. Write the sort of note a real but untidy person writes. You are not testing the app and you know nothing about its internals.",
+  "model": "opencode/deepseek-v4-flash-free",
+  "steps": [
+    {
+      "n": 1,
+      "action": {
+        "action": "type_and_save",
+        "text": "Sarah's recipe for that lemon cake was amazing \u2014 need to ask her for the exact measurements next time I see her. Also, don't forget mum's birthday is on the 15th!!!",
+        "why": "two realistic personal reminders with contractions, possessives, punctuation, and enthusiasm"
+      },
+      "notes_before": "5",
+      "ui_status": "Saved!",
+      "notes_after": "5",
+      "finding": {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"Sarah's recipe for that lemon cake was amazing \u2014 need to ask her for the exact measurements next time I see her. Also, don't forget mum's birthday is on the 15th!!!\" reported saved but count stayed at 5"
+      }
+    },
+    {
+      "n": 2,
+      "action": {
+        "action": "type_and_save",
+        "text": "Just realised I left my keys in the office AGAIN \u2014 this is like the 4th time this month. Really need to get one of those key tracker things. Also saw a great deal on noise-cancelling headphones at the mall, \u20ac89 instead of \u20ac150. Should I get them?",
+        "why": "Continuing the messy but authentic note pattern \u2014 everyday frustrations mixed with spontaneous decisions, matching the previous tone."
+      },
+      "notes_before": "5",
+      "ui_status": "Saved!",
+      "notes_after": "6"
+    },
+    {
+      "n": 3,
+      "action": {
+        "action": "type_and_save",
+        "text": "tech store \u2014 Sony WH-1000XM5s were 30% off but I hesitated and now I'm kicking myself. Check back next week. Also need to pick up dry cleaning before Friday or they'll charge extra ugh",
+        "why": "completes the interrupted thought from the previous note about headphones, adds typical everyday errand, and keeps the messy real-person style with dashes, slang, and abrupt topic switching"
+      },
+      "notes_before": "6",
+      "ui_status": "Saved!",
+      "notes_after": "6",
+      "finding": {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"tech store \u2014 Sony WH-1000XM5s were 30% off but I hesitated and now I'm kicking myself. Check back next week. Also need to pick up dry cleaning before Friday or they'll charge extra ugh\" reported saved but count stayed at 6"
+      }
+    },
+    {
+      "n": 4,
+      "action": {
+        "action": "type_and_save",
+        "text": "Been thinking about starting a small vegetable garden on the balcony \u2014 tomatoes and maybe some basil. Watched like 5 YouTube tutorials last night and now I'm convinced I can do it lol. Need to actually buy pots and soil this weekend though, not just watch more videos...",
+        "why": "realistic personal note about a new hobby impulse, with the classic procrastination pattern"
+      },
+      "notes_before": "6",
+      "ui_status": "Saved!",
+      "notes_after": "6",
+      "finding": {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"Been thinking about starting a small vegetable garden on the balcony \u2014 tomatoes and maybe some basil. Watched like 5 YouTube tutorials last night and now I'm convinced I can do it lol. Need to actuall\" reported saved but count stayed at 6"
+      }
+    },
+    {
+      "n": 5,
+      "action": {
+        "action": "type_and_save",
+        "text": "Need to actually buy soil and pots this weekend before I lose momentum lol. The balcony gets good morning sun so tomatoes should work. Also read that marigolds help keep pests away \u2014 might grab some of those too. Knowing me I'll end up with 3 dead plants and a lot of guilt but hey we try",
+        "why": "Continues the vegetable-garden train of thought from the last note in a natural, messy voice with realistic procrastination and self-deprecation."
+      },
+      "notes_before": "6",
+      "ui_status": "Saved!",
+      "notes_after": "7"
+    },
+    {
+      "n": 6,
+      "action": {
+        "action": "type_and_save",
+        "text": "might grab some of those too actually \u2014 apparently they're good companion plants. Alright this is getting long time to actually do it lol",
+        "why": "continuing the balcony garden train of thought with a natural trailing-off ending"
+      },
+      "notes_before": "7",
+      "ui_status": "Saved!",
+      "notes_after": "7",
+      "finding": {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"might grab some of those too actually \u2014 apparently they're good companion plants. Alright this is getting long time to actually do it lol\" reported saved but count stayed at 7"
+      }
+    }
+  ],
+  "notes_written": [
+    "Sarah's recipe for that lemon cake was amazing \u2014 need to ask her for the exact measurements next time I see her. Also, don't forget mum's birthday is on the 15th!!!",
+    "Just realised I left my keys in the office AGAIN \u2014 this is like the 4th time this month. Really need to get one of those key tracker things. Also saw a great deal on noise-cancelling headphones at the",
+    "tech store \u2014 Sony WH-1000XM5s were 30% off but I hesitated and now I'm kicking myself. Check back next week. Also need to pick up dry cleaning before Friday or they'll charge extra ugh",
+    "Been thinking about starting a small vegetable garden on the balcony \u2014 tomatoes and maybe some basil. Watched like 5 YouTube tutorials last night and now I'm convinced I can do it lol. Need to actuall",
+    "Need to actually buy soil and pots this weekend before I lose momentum lol. The balcony gets good morning sun so tomatoes should work. Also read that marigolds help keep pests away \u2014 might grab some o",
+    "might grab some of those too actually \u2014 apparently they're good companion plants. Alright this is getting long time to actually do it lol"
+  ],
+  "requests_raw": "### Result\n2. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n3. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n4. [POST] http://127.0.0.1:8940/api/notes => [500] Internal Server Error\n5. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n6. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n7. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n8. [POST] http://127.0.0.1:8940/api/notes => [201] Created\n9. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n10. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n11. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n12. [POST] http://127.0.0.1:8940/api/notes => [500] Internal Server Error\n13. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n14. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n15. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n16. [POST] http://127.0.0.1:8940/api/notes => [500] Internal Server Error\n17. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n18. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n19. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n20. [POST] http://127.0.0.1:8940/api/notes => [201] Created\n21. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n22. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n23. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n24. [POST] http://127.0.0.1:8940/api/notes => [500] Internal Server Error\n25. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n26. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n\nNote: 1 static request not shown, run with --static option to see it.",
+  "console_raw": "### Result\nTotal messages: 5 (Errors: 5, Warnings: 0)\n\n[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8940/favicon.ico:0\n[ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://127.0.0.1:8940/api/notes:0\n[ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://127.0.0.1:8940/api/notes:0\n[ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://127.0.0.1:8940/api/notes:0\n[ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://127.0.0.1:8940/api/notes:0",
+  "verdict": {
+    "bug": true,
+    "findings": [
+      {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"Sarah's recipe for that lemon cake was amazing \u2014 need to ask her for the exact measurements next time I see her. Also, don't forget mum's birthday is on the 15th!!!\" reported saved but count stayed at 5"
+      },
+      {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"tech store \u2014 Sony WH-1000XM5s were 30% off but I hesitated and now I'm kicking myself. Check back next week. Also need to pick up dry cleaning before Friday or they'll charge extra ugh\" reported saved but count stayed at 6"
+      },
+      {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"Been thinking about starting a small vegetable garden on the balcony \u2014 tomatoes and maybe some basil. Watched like 5 YouTube tutorials last night and now I'm convinced I can do it lol. Need to actuall\" reported saved but count stayed at 6"
+      },
+      {
+        "signal": "state-divergence",
+        "severity": "high",
+        "detail": "note \"might grab some of those too actually \u2014 apparently they're good companion plants. Alright this is getting long time to actually do it lol\" reported saved but count stayed at 7"
+      }
+    ]
+  }
+}

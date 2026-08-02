@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Compile a QA trace into a REPRO: a minimal, replayable artifact.
+
+Why this exists: a finding that cannot be replayed is not evidence. Without a
+repro you cannot do fail-before / pass-after, so you cannot prove a fix actually
+fixed anything — you can only prove the harness stopped complaining, which is
+not the same claim.
+
+Design choice — the repro is DECLARATIVE (repro.json), not generated code:
+
+  * Generated shell/JS is brittle: quoting, escaping and environment drift make
+    it rot fast, and a repro that fails for its own reasons is worse than none.
+  * A declarative repro replays through one audited runner (qa-verify), so the
+    replay semantics are identical every time and testable in one place.
+  * `@playwright/test` is deliberately not used — it is not installed here, and
+    the playwright skill says not to pivot to it without being asked.
+
+Trade-off, stated plainly: a repro.json needs this repo's runner to execute,
+whereas a standalone spec file could be handed to anyone. If that portability is
+wanted later, emit a spec FROM repro.json rather than from the raw trace.
+
+  qa-compile --trace runs/x/trace.json --out repros/apostrophe-500
+"""
+import argparse
+import json
+import os
+import sys
+
+# Which assertion proves a given signal came back.
+ASSERTIONS = {
+    "state-divergence": {
+        "type": "state_unchanged_despite_success_ui",
+        "describe": "UI reports success but authoritative state does not change",
+    },
+    "server-error": {
+        "type": "server_error_observed",
+        "describe": "a response with status >= 500 occurs during the scenario",
+    },
+    "console-error": {
+        "type": "console_error_observed",
+        "describe": "a non-benign console error occurs during the scenario",
+    },
+}
+
+
+def compile_repro(trace_path, out_dir, prefer=None):
+    with open(trace_path) as fh:
+        trace = json.load(fh)
+
+    verdict = trace.get("verdict") or {}
+    findings = verdict.get("findings") or []
+    if not findings:
+        print("qa-compile: trace has no findings — nothing to reproduce", file=sys.stderr)
+        return None
+
+    # Minimise: reproduce ONE finding, not all of them. A repro asserting
+    # several unrelated things fails for ambiguous reasons.
+    #
+    # Default ordering puts state-divergence first because it is the user-facing
+    # HARM (data silently lost); a 500 is merely the mechanism, and a fix could
+    # plausibly change the status code while leaving the loss in place.
+    # --prefer overrides this when you specifically want the mechanism pinned.
+    order = {"state-divergence": 0, "server-error": 1, "console-error": 2}
+    if prefer:
+        matches = [f for f in findings if f["signal"] == prefer]
+        if not matches:
+            print("qa-compile: no %r finding in this trace (have: %s)"
+                  % (prefer, ", ".join(sorted({f["signal"] for f in findings}))),
+                  file=sys.stderr)
+            return None
+        primary = matches[0]
+    else:
+        primary = sorted(findings, key=lambda f: order.get(f["signal"], 99))[0]
+
+    if primary["signal"] not in ASSERTIONS:
+        print("qa-compile: no assertion defined for %r" % primary["signal"], file=sys.stderr)
+        return None
+
+    repro = {
+        "from_trace": os.path.abspath(trace_path),
+        "scenario": trace["scenario"],
+        "input_text": trace["text"],
+        "reproduces": primary["signal"],
+        "severity": primary["severity"],
+        "observed": primary["detail"],
+        "assertion": ASSERTIONS[primary["signal"]],
+        # The action sequence, stripped to what is needed to hit the bug.
+        "steps": [
+            {"op": "open", "target": "{{URL}}"},
+            {"op": "read_state", "as": "before"},
+            {"op": "fill", "selector": "#t", "value": trace["text"]},
+            {"op": "click", "selector": "#save"},
+            {"op": "settle", "seconds": 1.2},
+            {"op": "read_ui_status", "selector": "#status"},
+            {"op": "read_state", "as": "after"},
+        ],
+        # How authoritative state is read. Kept explicit so the repro does not
+        # silently depend on app internals changing shape.
+        "state_probe": "async () => (await (await fetch('/api/notes')).json()).length",
+    }
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "repro.json")
+    with open(path, "w") as fh:
+        json.dump(repro, fh, indent=2)
+    return path, repro
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trace", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--prefer", choices=sorted(ASSERTIONS),
+                    help="pin the repro to this signal instead of the strongest one")
+    a = ap.parse_args()
+
+    res = compile_repro(a.trace, a.out, a.prefer)
+    if not res:
+        return 2
+    path, repro = res
+    print("repro -> %s" % path)
+    print("  reproduces : %s (%s)" % (repro["reproduces"], repro["severity"]))
+    print("  scenario   : %s  input=%r" % (repro["scenario"], repro["input_text"]))
+    print("  asserts    : %s" % repro["assertion"]["describe"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

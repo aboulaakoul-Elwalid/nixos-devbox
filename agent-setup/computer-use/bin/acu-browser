@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# acu-browser — persistent, authenticated browser profiles for verification.
+#
+# The verification surfaces that matter most are behind a login: your own
+# dashboards, a deployed app, an admin console. Disposable profiles cannot
+# reach any of them, so every previous run here has been limited to public or
+# localhost pages.
+#
+#   acu-browser login  <name> [url]   headed, in a NESTED desktop — you log in
+#   acu-browser check  <name> [url]   headless — is the session still valid?
+#   acu-browser open   <name> [url]   headless + CDP, ready to drive
+#   acu-browser list
+#   acu-browser forget <name>         delete the profile (and its cookies)
+#
+# WHY A DEDICATED PROFILE, NOT YOUR REAL BROWSER
+#   Driving your everyday browser gives an agent reach over every session you
+#   have at once. One profile per target bounds the blast radius to that single
+#   login, and keeps your working browser free while automation runs.
+#
+#   Login happens in a NESTED desktop, so a headed window never lands on your
+#   live workspace. You type the password; nothing is scripted, stored, or read
+#   by this tool — only the browser's own profile directory persists it.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STORE="${ACU_PROFILE_DIR:-$HOME/.local/share/acu/profiles}"
+CHROMIUM="$(command -v chromium 2>/dev/null || true)"
+
+die() { echo "acu-browser: $*" >&2; exit 1; }
+[ -n "$CHROMIUM" ] || die "no chromium on PATH"
+
+_profile_dir() { printf '%s/%s' "$STORE" "$1"; }
+
+_cdp_port() { # deterministic per profile so `open` and drivers agree
+  python3 -c "
+import sys, zlib
+print(9400 + zlib.crc32(sys.argv[1].encode()) % 400)" "$1"
+}
+
+# Chromium only writes cookies to disk on a GRACEFUL shutdown. Killing it
+# leaves an empty cookie DB — measured: a session cookie set seconds earlier
+# was simply gone after SIGTERM. For this tool that would silently discard a
+# login the user had just typed by hand, so shutdown goes through CDP
+# Browser.close and only falls back to signals if that fails.
+_shutdown() { # port, profile-dir
+  local port="$1" dir="$2"
+  python3 - "$port" <<'PY' 2>/dev/null || true
+import json, sys, urllib.request
+try:
+    import websockets.sync.client as wsc
+except ImportError:
+    sys.exit(0)
+port = sys.argv[1]
+try:
+    v = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5))
+    with wsc.connect(v["webSocketDebuggerUrl"], max_size=5_000_000) as ws:
+        ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+        ws.recv()
+except Exception:
+    pass
+PY
+  local i
+  for i in $(seq 1 20); do
+    curl -sf --max-time 1 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  echo "acu-browser: graceful close timed out; falling back to signal (session may be lost)" >&2
+  pkill -f -- "--user-data-dir=$dir" 2>/dev/null || true
+  sleep 2
+}
+
+_wait_cdp() {
+  local port="$1" i
+  for i in $(seq 1 60); do
+    curl -sf --max-time 2 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+_launch() { # profile-dir, port, headless(0/1), url, [wayland-display] [hypr-sig] [dbus]
+  local dir="$1" port="$2" headless="$3" url="${4:-about:blank}"
+  local wl="${5:-}" sig="${6:-}" dbus="${7:-}"
+  local args=(
+    --user-data-dir="$dir"
+    --remote-debugging-port="$port"
+    --no-first-run --no-default-browser-check
+    --disable-features=Translate
+    --no-sandbox --disable-dev-shm-usage
+  )
+  [ "$headless" = "1" ] && args+=(--headless=new --disable-gpu) \
+                        || args+=(--ozone-platform=wayland --disable-gpu)
+  if [ -n "$wl" ]; then
+    WAYLAND_DISPLAY="$wl" HYPRLAND_INSTANCE_SIGNATURE="$sig" \
+      DBUS_SESSION_BUS_ADDRESS="$dbus" setsid "$CHROMIUM" "${args[@]}" "$url" \
+      >"$dir/../$(basename "$dir").log" 2>&1 &
+  else
+    setsid "$CHROMIUM" "${args[@]}" "$url" >"$dir/../$(basename "$dir").log" 2>&1 &
+  fi
+  echo $!
+}
+
+cmd_login() {
+  local name="${1:?login needs a profile name}" url="${2:-about:blank}"
+  local dir; dir="$(_profile_dir "$name")"
+  mkdir -p "$dir"
+  local port; port="$(_cdp_port "$name")"
+
+  # Headed browsers go in a nested desktop so nothing lands on the live one.
+  export ACU_STATE_DIR="${ACU_STATE_DIR:-$HOME/.local/share/acu/sessions}"
+  local sess="browser-$name"
+  "$ROOT/bin/acu-session" destroy "$sess" >/dev/null 2>&1 || true
+  "$ROOT/bin/acu-session" start --name "$sess" --size 1400x900 >/dev/null \
+    || die "could not start a nested desktop for login"
+  local sig disp dbus
+  sig="$("$ROOT/bin/acu-session" info "$sess" | sed -n 's/^signature=//p')"
+  disp="$("$ROOT/bin/acu-session" info "$sess" | sed -n 's/^display=//p')"
+  dbus="$(python3 -c "import json;print(json.load(open('$ACU_STATE_DIR/$sess/meta.json')).get('dbus_address',''))")"
+
+  _launch "$dir" "$port" 0 "$url" "$disp" "$sig" "$dbus" >/dev/null
+  _wait_cdp "$port" || die "browser did not come up"
+
+  cat <<MSG
+
+  Profile '$name' is open in a nested desktop.
+
+    watch / interact:   hyprctl dispatch togglespecialworkspace agent
+    log in by hand, then press ENTER here.
+
+  Nothing is scripted or recorded — the browser's own profile keeps the session.
+
+MSG
+  read -r _
+  _shutdown "$port" "$dir"
+  "$ROOT/bin/acu-session" destroy "$sess" >/dev/null 2>&1 || true
+  echo "saved profile: $dir"
+}
+
+cmd_open() {
+  local name="${1:?open needs a profile name}" url="${2:-about:blank}"
+  local dir; dir="$(_profile_dir "$name")"
+  # Create on demand, but say so. Silently creating an empty profile and then
+  # reporting "logged out" is a confusing failure; an explicit warning keeps a
+  # fresh profile from being mistaken for an expired session.
+  if [ ! -d "$dir" ]; then
+    echo "acu-browser: creating NEW profile '$name' (not logged in to anything yet)" >&2
+    mkdir -p "$dir"
+  fi
+  local port; port="$(_cdp_port "$name")"
+  if curl -sf --max-time 2 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1; then
+    echo "acu-browser: profile '$name' already running" >&2
+    echo "$port"; return 0   # stdout is ONLY the port, so callers can consume it
+  fi
+  _launch "$dir" "$port" 1 "$url" >/dev/null
+  _wait_cdp "$port" || die "browser did not come up"
+  echo "$port"
+}
+
+cmd_check() {
+  local name="${1:?check needs a profile name}" url="${2:?check needs a url}"
+  local port; port="$(cmd_open "$name" "$url")" || return 1
+  sleep 3
+  # Signed-in state is app-specific, so report the evidence rather than guess:
+  # final URL after any redirect, title, and whether a login form is present.
+  python3 - "$port" "$url" <<'PY'
+import json, sys, urllib.request, time
+port, want = sys.argv[1], sys.argv[2]
+t = [x for x in json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=8))
+     if x.get("type") == "page"]
+if not t:
+    print("no page"); sys.exit(1)
+print("  final url : %s" % t[0].get("url", "")[:110])
+print("  title     : %s" % (t[0].get("title") or "")[:80])
+u = t[0].get("url", "").lower()
+hint = "LOGGED OUT (redirected to a login/auth page)" if any(
+    k in u for k in ("login", "signin", "sign-in", "auth")) else "no login redirect seen"
+print("  verdict   : %s" % hint)
+PY
+}
+
+cmd_list() {
+  [ -d "$STORE" ] || { echo "(no profiles)"; return 0; }
+  local any=0 d n
+  for d in "$STORE"/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"; any=1
+    local ck="$d/Default/Cookies"
+    printf '  %-20s port=%-6s cookies=%s  %s\n' "$n" "$(_cdp_port "$n")" \
+      "$([ -f "$ck" ] && echo yes || echo no)" \
+      "$(du -sh "$d" 2>/dev/null | cut -f1)"
+  done
+  [ "$any" -eq 0 ] && echo "(no profiles)"
+  return 0
+}
+
+cmd_close() {
+  local name="${1:?close needs a profile name}"
+  local dir; dir="$(_profile_dir "$name")"
+  _shutdown "$(_cdp_port "$name")" "$dir"
+  echo "closed $name (session flushed to disk)"
+}
+
+cmd_forget() {
+  local name="${1:?forget needs a profile name}"
+  local dir; dir="$(_profile_dir "$name")"
+  [ -d "$dir" ] || die "no such profile '$name'"
+  _shutdown "$(_cdp_port "$name")" "$dir"
+  rm -rf "$dir"
+  echo "forgot $name (cookies and session deleted)"
+}
+
+case "${1:-}" in
+  login)  shift; cmd_login  "$@" ;;
+  close)  shift; cmd_close  "$@" ;;
+  open)   shift; cmd_open   "$@" ;;
+  check)  shift; cmd_check  "$@" ;;
+  list)   shift; cmd_list   "$@" ;;
+  forget) shift; cmd_forget "$@" ;;
+  ""|-h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac

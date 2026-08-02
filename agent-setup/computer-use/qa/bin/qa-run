@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Run one QA scenario against a running app and emit a structured verdict.
+
+The point of this file is the ORACLE, not the driving. Driving a browser is
+easy; deciding "did that session actually surface a bug?" is the part that makes
+a QA harness trustworthy or noisy.
+
+Signals used, strongest first:
+
+  1. STATE DIVERGENCE — the UI claims success while a re-read of authoritative
+     state disagrees. This is the only signal that catches an optimistic UI
+     lying about a failed write, and it is invisible to screenshots.
+  2. SERVER ERROR — any response >= 500 during the scenario.
+  3. CONSOLE ERROR — uncaught page errors, after filtering benign noise.
+
+Signals deliberately NOT treated as bugs on their own: 4xx (often legitimate
+validation), favicon/asset 404s, console warnings. Those are the classic sources
+of false positives that make naive harnesses unusable.
+
+Usage:
+  qa-run --url http://127.0.0.1:8910 --scenario save-apostrophe --out runs/x
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+PWCLI = os.environ.get(
+    "PWCLI", os.path.expanduser("~/.codex/skills/playwright/scripts/playwright_cli.sh"))
+
+# Console messages that are noise rather than defects.
+BENIGN_CONSOLE = [
+    re.compile(r"favicon\.ico"),
+    re.compile(r"Download the React DevTools"),
+]
+
+
+class Pw:
+    """Thin wrapper over playwright-cli, scoped to one session."""
+
+    def __init__(self, session, workspace):
+        self.session = session
+        self.workspace = workspace
+
+    def __call__(self, *args, raw=False):
+        cmd = [PWCLI, "-s=" + self.session]
+        if raw:
+            cmd.append("--raw")
+        cmd += list(args)
+        r = subprocess.run(cmd, cwd=self.workspace, capture_output=True, text=True, timeout=180)
+        return r.stdout.strip()
+
+    def close(self):
+        try:
+            self("close")
+        except Exception:
+            pass
+
+
+SCENARIOS = {
+    # (label, text to type)
+    "save-plain":      "buy milk",
+    "save-apostrophe": "it's late",
+}
+
+
+def run(url, scenario, out_dir, workspace):
+    text = SCENARIOS[scenario]
+    os.makedirs(out_dir, exist_ok=True)
+    pw = Pw("qa-%s-%d" % (scenario, os.getpid()), workspace)
+
+    trace = {"scenario": scenario, "url": url, "text": text, "actions": []}
+
+    def act(name, *args, **kw):
+        res = pw(*args, **kw)
+        trace["actions"].append({"action": name, "args": list(args)})
+        return res
+
+    try:
+        act("open", "open", url)
+        # authoritative state BEFORE the action
+        before = pw("eval", "async () => (await (await fetch('/api/notes')).json()).length", raw=True)
+        trace["notes_before"] = before.strip().strip('"')
+
+        act("fill", "fill", "#t", text)
+        act("click", "click", "#save")
+        time.sleep(1.2)
+
+        # what the UI claims
+        ui_status = pw("eval", "() => document.getElementById('status').textContent", raw=True)
+        trace["ui_status"] = ui_status.strip().strip('"')
+
+        # authoritative state AFTER — this is the divergence check
+        after = pw("eval", "async () => (await (await fetch('/api/notes')).json()).length", raw=True)
+        trace["notes_after"] = after.strip().strip('"')
+
+        # network + console
+        reqs = pw("requests")
+        trace["requests_raw"] = reqs
+        console = pw("console")
+        trace["console_raw"] = console
+    finally:
+        pw.close()
+
+    verdict = judge(trace)
+    trace["verdict"] = verdict
+    with open(os.path.join(out_dir, "trace.json"), "w") as fh:
+        json.dump(trace, fh, indent=2)
+    return trace
+
+
+def judge(trace):
+    # QA_DISABLE_SIGNAL exists so the gate can be mutation-tested: disabling a
+    # signal MUST turn the row that depends on it red. A gate that stays green
+    # with its oracle crippled is not a gate.
+    disabled = set(filter(None, os.environ.get("QA_DISABLE_SIGNAL", "").split(",")))
+    findings = []
+
+    # 1. state divergence — UI said saved, authoritative count did not move
+    try:
+        before = int(trace.get("notes_before", "0") or 0)
+        after = int(trace.get("notes_after", "0") or 0)
+    except ValueError:
+        before = after = -1
+    claimed = "saved" in (trace.get("ui_status") or "").lower()
+    if "state-divergence" not in disabled and claimed and before >= 0 and after == before:
+        findings.append({
+            "signal": "state-divergence",
+            "severity": "high",
+            "detail": "UI reported %r but authoritative note count stayed at %d"
+                      % (trace.get("ui_status"), after),
+        })
+
+    # 2. server errors
+    for line in ([] if "server-error" in disabled
+                 else (trace.get("requests_raw") or "").splitlines()):
+        m = re.search(r"\[(\d{3})\]", line) or re.search(r"\s(\d{3})\s", line)
+        if m and int(m.group(1)) >= 500:
+            findings.append({
+                "signal": "server-error",
+                "severity": "high",
+                "detail": line.strip(),
+            })
+
+    # 3. console errors, minus known noise
+    for line in ([] if "console-error" in disabled
+                 else (trace.get("console_raw") or "").splitlines()):
+        if "[ERROR]" not in line:
+            continue
+        if any(p.search(line) for p in BENIGN_CONSOLE):
+            continue
+        findings.append({
+            "signal": "console-error",
+            "severity": "medium",
+            "detail": line.strip(),
+        })
+
+    return {"bug": bool(findings), "findings": findings}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--scenario", required=True, choices=sorted(SCENARIOS))
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--workspace", default=os.environ.get("QA_WORKSPACE", "."))
+    a = ap.parse_args()
+
+    trace = run(a.url, a.scenario, a.out, a.workspace)
+    v = trace["verdict"]
+    print("scenario=%s  bug=%s" % (a.scenario, v["bug"]))
+    for f in v["findings"]:
+        print("   [%s/%s] %s" % (f["severity"], f["signal"], f["detail"]))
+    print("trace -> %s/trace.json" % a.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# pw-init — make playwright-cli actually work on this NixOS box.
+#
+# Playwright's own browser binaries do not run on NixOS (they are dynamically
+# linked against an FHS layout that does not exist here), and the `chrome`
+# channel looks for /opt/google/chrome/chrome, which also does not exist.
+# Pointing nixpkgs' browser set at it does not help either, because the npx
+# @playwright/cli ships playwright-core 1.62-alpha while nixpkgs is on 1.58.2 —
+# mismatched browser revisions.
+#
+# What DOES work: launch the system chromium directly via launchOptions
+# .executablePath, with the sandbox/GPU flags headless chromium needs here.
+#
+#   pw-init [workspace-dir]     # defaults to $PWD
+#
+# Then, from that directory:
+#   export PWCLI="$HOME/.codex/skills/playwright/scripts/playwright_cli.sh"
+#   "$PWCLI" -s=mysession open http://127.0.0.1:PORT/
+#
+# NOTE: playwright-cli blocks file:// URLs — serve pages over HTTP.
+set -euo pipefail
+
+WS="${1:-$PWD}"
+CHROMIUM="$(readlink -f "$(command -v chromium 2>/dev/null || true)" 2>/dev/null || true)"
+
+if [ -z "$CHROMIUM" ] || [ ! -x "$CHROMIUM" ]; then
+  echo "pw-init: no chromium on PATH — cannot configure a working browser." >&2
+  echo "pw-init: refusing to write a config that would silently fail at launch." >&2
+  exit 1
+fi
+
+command -v npx >/dev/null || { echo "pw-init: npx required (playwright-cli runs via npx)" >&2; exit 1; }
+
+mkdir -p "$WS/.playwright"
+CFG="$WS/.playwright/cli.config.json"
+
+CHROMIUM="$CHROMIUM" python3 - "$CFG" <<'EOF'
+import json, os, sys
+cfg = {
+    "browser": {
+        "browserName": "chromium",
+        "launchOptions": {
+            # System chromium from the nix store. Re-run pw-init after a system
+            # update: this path changes with every chromium version bump.
+            "executablePath": os.environ["CHROMIUM"],
+            "args": [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        },
+    }
+}
+with open(sys.argv[1], "w") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+EOF
+
+echo "pw-init: wrote $CFG"
+echo "pw-init: chromium -> $CHROMIUM"
+echo "pw-init: verify with  ./test/test-playwright.sh"

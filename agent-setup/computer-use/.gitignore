@@ -1,0 +1,5 @@
+# transient test artifacts
+/tmp/
+*.png
+*.log
+.sink-*

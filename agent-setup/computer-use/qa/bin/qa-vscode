@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Drive and observe a VS Code / VSCodium extension UI over CDP.
+
+Why this exists: an extension's UI is NOT reachable the way a web app is.
+VS Code renders it inside a webview, and the real content sits in a frame
+nested one level deeper again:
+
+    workbench page  (playwright attaches here — sees only VS Code's chrome)
+      └─ webview target        (separate CDP target, host shell, empty body)
+           └─ inner frame      <- the extension's actual UI lives here
+
+Playwright's connectOverCDP does not attach to that out-of-process iframe, so
+`page.frames()` comes back empty for it. Raw CDP does reach it: the webview is
+its own target, and `Page.createIsolatedWorld` on its child frame gives an
+execution context for the extension's DOM.
+
+Verified against Argyris (VSCodium 1.112 / Chrome 142) on 2026-07-28.
+
+  qa-vscode --port 9333 observe
+  qa-vscode --port 9333 click "Browse demo runs"
+  qa-vscode --port 9333 key ctrl+shift+p        # chords, not just named keys
+  qa-vscode --port 9333 type "Argyris: Build"   # arbitrary text
+  qa-vscode --port 9333 scenario --click "Open a demo run" --settle 4
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+import urllib.request
+
+try:
+    import websockets.sync.client as wsc
+except ImportError:  # pragma: no cover
+    sys.exit("qa-vscode: needs `websockets` — run via:  uv run --with websockets qa-vscode ...")
+
+BENIGN_CONSOLE = [
+    re.compile(r"open-vsx\.org"),          # marketplace lookup for an unpublished dev extension
+    re.compile(r"computeSkillDiscoveryInfo"),  # host skill-folder naming, not the extension
+    re.compile(r"favicon\.ico"),
+]
+
+# Window classes that mean "the app opened a NATIVE dialog".
+#
+# This list exists because of a false positive worth remembering: clicking
+# "Browse demo runs" in Argyris changed nothing in the webview, nothing in the
+# workbench DOM, and nothing in the nested session's window list — so it was
+# reported as a silent no-op. It was not. It had opened an xdg-desktop-portal
+# file chooser on the HOST desktop.
+#
+# The portal is a host user service on the host session bus, so its windows
+# appear on the host even when the app runs in a nested compositor with its own
+# D-Bus. An oracle that only inspects the app's own surfaces cannot see the
+# response and will call a working control dead.
+NATIVE_DIALOG_CLASSES = re.compile(
+    r"xdg-desktop-portal|gtk-file|zenity|kdialog|nautilus", re.I)
+
+
+def host_dialog_count():
+    """Native dialogs currently open on the HOST desktop."""
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return sum(1 for c in json.loads(out or "[]")
+                   if NATIVE_DIALOG_CLASSES.search(c.get("class", "")))
+    except Exception:
+        return -1  # unknown — must not be read as "none"
+
+
+class Webview:
+    """Raw-CDP handle on the extension's inner frame."""
+
+    def __init__(self, port):
+        self.port = port
+        self.ws = None
+        self.cid = None
+        self._id = 0
+
+    def __enter__(self):
+        targets = json.load(urllib.request.urlopen(
+            "http://127.0.0.1:%s/json/list" % self.port, timeout=8))
+        wv = [t for t in targets if t.get("type") == "iframe" and "webview" in t.get("url", "")]
+        if not wv:
+            raise RuntimeError("no webview target on port %s — is the extension UI open?" % self.port)
+        self.ws = wsc.connect(wv[0]["webSocketDebuggerUrl"], max_size=20_000_000).__enter__()
+        self.call("Runtime.enable")
+        self.call("Log.enable")
+        tree = self.call("Page.getFrameTree")["result"]["frameTree"]
+        kids = tree.get("childFrames") or []
+        if not kids:
+            raise RuntimeError("webview has no inner frame — extension UI not rendered yet")
+        world = self.call("Page.createIsolatedWorld",
+                          {"frameId": kids[0]["frame"]["id"], "worldName": "qa"})
+        self.cid = world["result"]["executionContextId"]
+        return self
+
+    def __exit__(self, *a):
+        if self.ws:
+            try:
+                self.ws.__exit__(*a)
+            except Exception:
+                pass
+
+    def call(self, method, params=None):
+        self._id += 1
+        self.ws.send(json.dumps({"id": self._id, "method": method, "params": params or {}}))
+        while True:
+            msg = json.loads(self.ws.recv())
+            if msg.get("id") == self._id:
+                return msg
+
+    def ev(self, expr):
+        r = self.call("Runtime.evaluate",
+                      {"expression": expr, "contextId": self.cid,
+                       "returnByValue": True, "awaitPromise": True})
+        res = r.get("result", {})
+        if "exceptionDetails" in res:
+            return None
+        return res.get("result", {}).get("value")
+
+    # --- observation -----------------------------------------------------
+    def text(self, n=800):
+        return self.ev("document.body.innerText.slice(0,%d)" % n) or ""
+
+    def controls(self):
+        raw = self.ev("""JSON.stringify([...document.querySelectorAll('button,[role=button],a,input,select')]
+            .map(e => ({tag:e.tagName,
+                        text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim().slice(0,60),
+                        disabled: !!e.disabled}))
+            .filter(x => x.text))""")
+        try:
+            return json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            return []
+
+    def state_hash(self):
+        return self.ev("(document.body.innerText||'').length")
+
+    # --- action ----------------------------------------------------------
+    def click(self, label):
+        """Click a control by ELEMENT, not by screen coordinate.
+
+        Coordinate dispatch was tried and is WRONG here: getBoundingClientRect()
+        returns coordinates in the INNER frame's space, while
+        Input.dispatchMouseEvent applies them to the webview TARGET's viewport.
+        The offset silently lands the click on a neighbouring control — which is
+        exactly how a working "Choose folder..." got mistaken for a response
+        from "Browse demo runs" and nearly inverted a finding.
+
+        element.click() only dispatches a `click` event, so a handler bound
+        solely to pointerdown would not fire. That risk is real but measured:
+        element.click() successfully triggers 2 of the 4 primary controls in
+        this app, so the handlers do listen for click. If a future target
+        appears dead here, re-check it by hand before believing the harness.
+        """
+        box = self.ev("""(function(){
+            var want = %s;
+            var els = [...document.querySelectorAll('button,[role=button],a,input,select')];
+            var hit = els.find(function(e){
+                var t = (e.innerText||e.value||e.getAttribute('aria-label')||'');
+                return t.toLowerCase().indexOf(want.toLowerCase()) !== -1;
+            });
+            if (!hit) return null;
+            hit.scrollIntoView({block:'center'});
+            var r = hit.getBoundingClientRect();
+            return JSON.stringify({x:r.left+r.width/2, y:r.top+r.height/2,
+                                   w:r.width, h:r.height});
+        })()""" % json.dumps(label))
+        if not box:
+            return "NOT_FOUND"
+        b = json.loads(box)
+        if b["w"] < 1 or b["h"] < 1:
+            return "NOT_CLICKABLE"
+        self.ev("""(function(){
+            var want = %s;
+            var els = [...document.querySelectorAll('button,[role=button],a,input,select')];
+            var hit = els.find(function(e){
+                var t = (e.innerText||e.value||e.getAttribute('aria-label')||'');
+                return t.toLowerCase().indexOf(want.toLowerCase()) !== -1;
+            });
+            if (hit) hit.click();
+        })()""" % json.dumps(label))
+        return "CLICKED"
+
+
+def console_errors(port):
+    """Non-benign console errors from the workbench page."""
+    targets = json.load(urllib.request.urlopen(
+        "http://127.0.0.1:%s/json/list" % port, timeout=8))
+    page = [t for t in targets if t.get("type") == "page"]
+    if not page:
+        return []
+    out = []
+    with wsc.connect(page[0]["webSocketDebuggerUrl"], max_size=20_000_000) as ws:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.enable"}))
+        # drain whatever is already buffered; best-effort, non-blocking-ish
+        try:
+            ws.socket.settimeout(2.0)
+            while True:
+                msg = json.loads(ws.recv())
+                if msg.get("method") == "Runtime.consoleAPICalled" \
+                        and msg["params"].get("type") == "error":
+                    txt = " ".join(str(a.get("value", "")) for a in msg["params"].get("args", []))
+                    if not any(p.search(txt) for p in BENIGN_CONSOLE):
+                        out.append(txt[:200])
+        except Exception:
+            pass
+    return out
+
+
+WORKBENCH_JS = r"""(() => {
+  const txt = (el) => (el ? (el.innerText || el.textContent || "").trim() : "");
+  const all = (sel) => Array.from(document.querySelectorAll(sel));
+  const vis = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const qp = document.querySelector(".quick-input-widget");
+  return {
+    notifications: all(".notification-list-item-message").map(txt).filter(Boolean),
+    // Modal dialogs are a separate widget from notifications and block the UI.
+    dialogs: all(".monaco-dialog-box .dialog-message-text").map(txt).filter(Boolean),
+    quickpick: vis(qp) ? {
+      prompt: txt(qp.querySelector(".quick-input-description"))
+              || (qp.querySelector(".quick-input-box input") || {}).placeholder || "",
+      // The Command Palette shows what has been TYPED, not a placeholder, so
+      // without this the palette looks identical to an empty QuickPick.
+      typed: (qp.querySelector(".quick-input-box input") || {}).value || "",
+      items: all(".quick-input-list .monaco-list-row").map(txt).filter(Boolean).slice(0, 12),
+    } : null,
+    statusbar: all(".statusbar-item").map(txt).filter(Boolean).slice(0, 12),
+  };
+})()"""
+
+
+def workbench_state(port):
+    """What the VS Code SHELL is showing: notifications, QuickPick, modal dialogs.
+
+    An extension often reports its result here rather than in its own webview.
+    Argyris' folder-pick is the case that forced this: after binding a run
+    folder the Home webview was byte-identical, while the workbench showed a
+    QuickPick ("Several report families can read this output") and a
+    notification ("3 files inventoried"). A webview-only oracle calls that a
+    silent no-op — the same false positive this harness already made once.
+    """
+    targets = json.load(urllib.request.urlopen(
+        "http://127.0.0.1:%s/json/list" % port, timeout=8))
+    pages = [t for t in targets if t.get("type") == "page"]
+    wb = [t for t in pages if "workbench" in t.get("url", "")] or pages
+    if not wb:
+        return None
+    with wsc.connect(wb[0]["webSocketDebuggerUrl"], max_size=20_000_000) as ws:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": WORKBENCH_JS,
+                                       "returnByValue": True, "awaitPromise": False}}))
+        while True:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == 1:
+                return (msg.get("result", {}).get("result", {}) or {}).get("value")
+
+
+KEYS = {  # key name -> (virtual key code, DOM code)
+    "Escape": (27, "Escape"), "Enter": (13, "Enter"), "Tab": (9, "Tab"),
+    "ArrowDown": (40, "ArrowDown"), "ArrowUp": (38, "ArrowUp"),
+    "ArrowLeft": (37, "ArrowLeft"), "ArrowRight": (39, "ArrowRight"),
+    "Backspace": (8, "Backspace"), "Space": (32, "Space"),
+}
+
+
+# CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
+MODS = {"alt": 1, "ctrl": 2, "control": 2, "meta": 4, "cmd": 4, "shift": 8}
+
+
+def _page_ws(port):
+    targets = json.load(urllib.request.urlopen(
+        "http://127.0.0.1:%s/json/list" % port, timeout=8))
+    pages = [t for t in targets if t.get("type") == "page"]
+    wb = [t for t in pages if "workbench" in t.get("url", "")] or pages
+    if not wb:
+        raise SystemExit("qa-vscode: no workbench page to drive")
+    return wb[0]["webSocketDebuggerUrl"]
+
+
+def send_text(port, text):
+    """Type arbitrary text via CDP Input.insertText.
+
+    `key` only presses named keys, which left no way to type into a Command
+    Palette or a search box — a real hole, since isolating "is the command
+    handler broken" from "is the button wired wrong" means running the command
+    by name. insertText delivers the whole string in one call, so it also skips
+    the per-character races that break synthetic typing elsewhere.
+    """
+    with wsc.connect(_page_ws(port), max_size=20_000_000) as ws:
+        ws.send(json.dumps({"id": 1, "method": "Input.insertText",
+                            "params": {"text": text}}))
+        while True:
+            if json.loads(ws.recv()).get("id") == 1:
+                break
+
+
+def send_key(port, name):
+    """Press a key via CDP, NOT the compositor.
+
+    This matters beyond convenience: wtype cannot reach a window inside a
+    nested session, and GTK's file-chooser location bar drops characters even
+    on the host. CDP sidesteps the whole input stack for anything
+    Chromium-based — the keystroke is injected into the renderer directly, so
+    it works headless, nested, and unfocused. Native (non-Electron) dialogs
+    still need the pointer path in `hcu-dialog`.
+    """
+    # Accept chords like "ctrl+shift+p" — a bare key set could not reach the
+    # Command Palette, which is the entry point for running a command by name.
+    parts = [p.strip() for p in name.split("+") if p.strip()]
+    base = parts[-1]
+    mask = 0
+    for m in parts[:-1]:
+        if m.lower() not in MODS:
+            raise SystemExit("qa-vscode: unknown modifier %r (have: %s)"
+                             % (m, ", ".join(sorted(set(MODS)))))
+        mask |= MODS[m.lower()]
+
+    if base in KEYS:
+        vk, code = KEYS[base]
+        key_name = base
+    elif len(base) == 1:
+        # Single printable character, e.g. the "p" in ctrl+shift+p.
+        vk = ord(base.upper())
+        code = "Key%s" % base.upper() if base.isalpha() else base
+        key_name = base
+    else:
+        raise SystemExit("qa-vscode: unknown key %r (named keys: %s; or a single character)"
+                         % (base, ", ".join(sorted(KEYS))))
+
+    with wsc.connect(_page_ws(port), max_size=20_000_000) as ws:
+        i = 0
+        for typ in ("rawKeyDown", "keyUp"):
+            i += 1
+            ws.send(json.dumps({"id": i, "method": "Input.dispatchKeyEvent", "params": {
+                "type": typ, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+                "key": key_name, "code": code, "modifiers": mask}}))
+            while True:
+                if json.loads(ws.recv()).get("id") == i:
+                    break
+
+
+def print_workbench(port):
+    st = workbench_state(port)
+    if st is None:
+        print("   (no workbench page reachable)")
+        return
+    for n in st.get("notifications") or []:
+        print("   NOTIFICATION  %s" % n[:160])
+    for d in st.get("dialogs") or []:
+        print("   MODAL DIALOG  %s" % d[:160])
+    qp = st.get("quickpick")
+    if qp:
+        label = qp.get("prompt") or ""
+        if qp.get("typed"):
+            label = "%s  [typed: %s]" % (label, qp["typed"])
+        print("   QUICKPICK     %s" % label[:160])
+        for it in qp.get("items") or []:
+            print("       - %s" % it.replace("\n", " ")[:120])
+
+    # A native dialog is a HOST window — outside the webview AND outside the
+    # workbench — so an app that answered by opening one looks completely silent
+    # here. That exact blind spot produced a false "silent no-op" finding once,
+    # and a dialog dismissed mid-session went unnoticed because nothing reported
+    # it. Always state the host-dialog count rather than leaving it implied.
+    nd = host_dialog_count()
+    if nd > 0:
+        print("   NATIVE DIALOG %d open on the HOST desktop — drive it with hcu-dialog" % nd)
+    elif nd < 0:
+        print("   NATIVE DIALOG unknown (could not query the compositor)")
+
+    if not (st.get("notifications") or st.get("dialogs") or qp) and nd == 0:
+        print("   (workbench quiet — no notification, dialog, quickpick or native dialog)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", default="9333")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("observe")
+    sub.add_parser("workbench")
+    k = sub.add_parser("key"); k.add_argument("name")
+    t = sub.add_parser("type"); t.add_argument("text")
+    c = sub.add_parser("click"); c.add_argument("label")
+    s = sub.add_parser("scenario")
+    s.add_argument("--click", action="append", default=[], help="label to click (repeatable)")
+    s.add_argument("--settle", type=float, default=3.0)
+    a = ap.parse_args()
+
+    import time
+    # The workbench view needs no webview attachment, and an extension can put
+    # its whole response there — so it must work even when the webview is gone.
+    if a.cmd == "workbench":
+        print("--- WORKBENCH ---")
+        print_workbench(a.port)
+        return 0
+
+    if a.cmd == "key":
+        send_key(a.port, a.name)
+        print("KEY %s" % a.name)
+        return 0
+
+    if a.cmd == "type":
+        send_text(a.port, a.text)
+        print("TYPED %d chars" % len(a.text))
+        return 0
+
+    with Webview(a.port) as w:
+        if a.cmd == "observe":
+            print("--- UI TEXT ---"); print(w.text())
+            print("--- CONTROLS ---")
+            for c_ in w.controls():
+                print("   %-8s %s%s" % (c_["tag"], c_["text"], "  [disabled]" if c_["disabled"] else ""))
+            print("--- WORKBENCH ---")
+            print_workbench(a.port)
+            return 0
+
+        if a.cmd == "click":
+            print(w.click(a.label)); return 0
+
+        # scenario: click a sequence, report state movement + findings
+        findings = []
+        for label in a.click:
+            before_len = w.state_hash()
+            before_ctrls = len(w.controls())
+            before_dlg = host_dialog_count()
+            res = w.click(label)
+            if res == "NOT_FOUND":
+                findings.append({"signal": "control-missing", "severity": "high",
+                                 "detail": "no control matching %r" % label})
+                print("  click %-28s -> NOT FOUND" % label)
+                continue
+            time.sleep(a.settle)
+            after_len = w.state_hash()
+            after_ctrls = len(w.controls())
+            after_dlg = host_dialog_count()
+
+            dom_moved = (after_len != before_len) or (after_ctrls != before_ctrls)
+            # A native dialog is a RESPONSE, even though it changes nothing in
+            # the app's own DOM. Missing this reported a working control dead.
+            dlg_opened = (before_dlg >= 0 and after_dlg > before_dlg)
+            moved = dom_moved or dlg_opened
+
+            how = ("native dialog" if dlg_opened else
+                   "DOM" if dom_moved else "nothing")
+            print("  %-30s -> %-10s via %-14s (text %s->%s, ctrls %s->%s, dlg %s->%s)"
+                  % (label, "RESPONDS" if moved else "NO CHANGE", how,
+                     before_len, after_len, before_ctrls, after_ctrls,
+                     before_dlg, after_dlg))
+
+            if dlg_opened:
+                # leave the user's desktop as we found it
+                subprocess.run(["bash", "-c",
+                    "hyprctl clients -j | python3 -c \"import sys,json;"
+                    "[print(c['address']) for c in json.load(sys.stdin) "
+                    "if 'xdg-desktop-portal' in c['class']]\" "
+                    "| while read a; do hyprctl dispatch closewindow address:$a >/dev/null; done"],
+                    capture_output=True, timeout=15)
+            elif before_dlg < 0:
+                findings.append({
+                    "signal": "oracle-blind", "severity": "high",
+                    "detail": "could not read host window list — a native-dialog "
+                              "response would be invisible, so NO-CHANGE is unsafe here"})
+            elif not moved:
+                findings.append({
+                    "signal": "no-visible-effect", "severity": "medium",
+                    "detail": "clicking %r changed no DOM state and opened no native dialog" % label})
+
+        errs = console_errors(a.port)
+        for e in errs:
+            findings.append({"signal": "console-error", "severity": "medium", "detail": e})
+
+        print("\n--- final UI ---"); print(w.text(400))
+        print("\n--- findings: %d ---" % len(findings))
+        for f in findings:
+            print("   [%s/%s] %s" % (f["severity"], f["signal"], f["detail"]))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

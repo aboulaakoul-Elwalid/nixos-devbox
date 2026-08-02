@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Drive the app as an LLM-directed synthetic user, then judge with the SAME oracle.
+
+The experiment this is built for: the scripted scenarios already know to type an
+apostrophe. A persona is given only a GOAL and must *discover* that input on its
+own. Whether it does is the honest test of persona-driven QA, and a negative
+result is a real finding rather than a failure of the harness.
+
+Deliberate constraints:
+  * The model chooses actions ONLY. It never decides whether something is a bug —
+    that stays with the validated oracle in qa-run. Letting the same model act
+    and judge would make the verdict unfalsifiable.
+  * Hard step budget. An unbounded agent loop is how these get expensive.
+  * The persona is never told the bug, the trigger, or that a bug exists.
+
+Model access goes through the local OpenCode server (free tier by default), not
+a paid API.
+
+  qa-persona --url http://127.0.0.1:8910 --steps 6 --out runs/p1
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+OC = os.environ.get("OPENCODE_URL", "http://127.0.0.1:4099")
+PROVIDER = os.environ.get("QA_PERSONA_PROVIDER", "opencode")
+MODEL = os.environ.get("QA_PERSONA_MODEL", "deepseek-v4-flash-free")
+PWCLI = os.environ.get(
+    "PWCLI", os.path.expanduser("~/.codex/skills/playwright/scripts/playwright_cli.sh"))
+
+NATURALISTIC = (
+    "You are a real person using a small web app to jot down quick notes. "
+    "Behave like an ordinary user: write the sort of short, natural notes a "
+    "person actually writes during a busy day. Vary your wording between notes. "
+    "You are not testing the app and you know nothing about its internals."
+)
+
+# Same task, different framing. Measured 2026-07-28: the naturalistic persona
+# wrote five plausible notes and triggered NOTHING, because ordinary prose
+# simply does not contain the character classes that break software. Realistic
+# behaviour is not coverage. This framing applies edge pressure explicitly while
+# still never naming the bug or its trigger.
+EDGE_SEEKING = (
+    "You are a real person using a small web app to jot down quick notes, but "
+    "your notes are messy and varied: you use contractions, quotes, names with "
+    "possessives, symbols, punctuation and occasionally very short or very long "
+    "text. Write the sort of note a real but untidy person writes. "
+    "You are not testing the app and you know nothing about its internals."
+)
+
+PERSONA = EDGE_SEEKING if os.environ.get("QA_PERSONA_STYLE") == "edge" else NATURALISTIC
+
+PROTOCOL = """You control a browser. Reply with ONE JSON object and nothing else:
+
+  {"action": "type_and_save", "text": "<the note to write>", "why": "<short reason>"}
+  {"action": "reload", "why": "..."}
+  {"action": "stop", "why": "..."}
+
+Do not use markdown fences. Do not explain outside the JSON."""
+
+
+class Pw:
+    def __init__(self, session, workspace):
+        self.session, self.workspace = session, workspace
+
+    def __call__(self, *args, raw=False):
+        cmd = [PWCLI, "-s=" + self.session] + (["--raw"] if raw else []) + list(args)
+        r = subprocess.run(cmd, cwd=self.workspace, capture_output=True, text=True, timeout=180)
+        return r.stdout.strip()
+
+    def close(self):
+        try:
+            self("close")
+        except Exception:
+            pass
+
+
+def ask_model(history, observation):
+    """One turn. Returns the parsed action dict, or None."""
+    sid = None
+    try:
+        req = urllib.request.Request(
+            OC + "/session", method="POST",
+            data=b"{}", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            sid = json.load(r)["id"]
+
+        prompt = "%s\n\nWhat you see now:\n%s\n\nNotes you have already written: %s" % (
+            PROTOCOL, observation, history or "(none yet)")
+        body = json.dumps({
+            "model": {"providerID": PROVIDER, "modelID": MODEL},
+            "system": PERSONA,
+            "tools": {},
+            "parts": [{"type": "text", "text": prompt}],
+        }).encode()
+        req = urllib.request.Request(
+            OC + "/session/%s/message" % sid, method="POST",
+            data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            resp = json.load(r)
+    except Exception as e:
+        print("  model call failed: %s %s" % (type(e).__name__, str(e)[:120]), file=sys.stderr)
+        return None
+    finally:
+        if sid:
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    OC + "/session/" + sid, method="DELETE"), timeout=20)
+            except Exception:
+                pass
+
+    text = " ".join(p.get("text", "") for p in (resp.get("parts") or [])
+                    if p.get("type") == "text").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--steps", type=int, default=6)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--workspace", default=os.environ.get("QA_WORKSPACE", "."))
+    a = ap.parse_args()
+
+    os.makedirs(a.out, exist_ok=True)
+    pw = Pw("persona-%d" % os.getpid(), a.workspace)
+    probe = "async () => (await (await fetch('/api/notes')).json()).length"
+
+    session = {"url": a.url, "persona": PERSONA, "model": "%s/%s" % (PROVIDER, MODEL),
+               "steps": [], "notes_written": []}
+    try:
+        pw("open", a.url)
+        for i in range(a.steps):
+            before = pw("eval", probe, raw=True).strip().strip('"')
+            obs = "The page has a text box and a Save button. Notes saved so far: %s" % before
+
+            action = ask_model(", ".join(session["notes_written"]), obs)
+            if not action:
+                print("step %d: no usable action from model — stopping" % (i + 1))
+                break
+            act = action.get("action")
+            print("step %d: %s %s" % (i + 1, act, json.dumps(action.get("text", ""))[:60]))
+
+            step = {"n": i + 1, "action": action, "notes_before": before}
+            if act == "stop":
+                session["steps"].append(step)
+                break
+            if act == "reload":
+                pw("open", a.url)
+            elif act == "type_and_save":
+                text = str(action.get("text", ""))[:200]
+                pw("fill", "#t", text)
+                pw("click", "#save")
+                time.sleep(1.2)
+                session["notes_written"].append(text)
+                step["ui_status"] = pw(
+                    "eval", "() => document.getElementById('status').textContent",
+                    raw=True).strip().strip('"')
+            else:
+                step["error"] = "unknown action %r" % act
+            step["notes_after"] = pw("eval", probe, raw=True).strip().strip('"')
+
+            # Per-step oracle: did this action lose data?
+            try:
+                b, aft = int(step["notes_before"] or 0), int(step["notes_after"] or 0)
+            except ValueError:
+                b = aft = -1
+            if act == "type_and_save" and b >= 0 and aft == b:
+                step["finding"] = {
+                    "signal": "state-divergence", "severity": "high",
+                    "detail": "note %r reported saved but count stayed at %d" % (text, aft)}
+                print("      ^ FINDING: note not persisted (%r)" % text)
+            session["steps"].append(step)
+
+        session["requests_raw"] = pw("requests")
+        session["console_raw"] = pw("console")
+    finally:
+        pw.close()
+
+    findings = [s["finding"] for s in session["steps"] if "finding" in s]
+    session["verdict"] = {"bug": bool(findings), "findings": findings}
+    with open(os.path.join(a.out, "persona.json"), "w") as fh:
+        json.dump(session, fh, indent=2)
+
+    print("\npersona wrote %d note(s); findings: %d"
+          % (len(session["notes_written"]), len(findings)))
+    for f in findings:
+        print("   [%s] %s" % (f["signal"], f["detail"]))
+    print("trace -> %s/persona.json" % a.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

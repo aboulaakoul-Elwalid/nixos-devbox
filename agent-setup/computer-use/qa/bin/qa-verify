@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Replay a repro against a build and report whether the bug is still there.
+
+This is the half that turns a finding into evidence. Point it at the build the
+bug was found on and it must say REPRODUCED; point it at the candidate fix and
+it must say NOT-REPRODUCED. Either result alone proves little — it is the PAIR
+that constitutes fail-before / pass-after.
+
+  qa-verify --repro repros/x/repro.json --url http://127.0.0.1:8910
+    -> REPRODUCED      (exit 0)   the bug is present on this build
+    -> NOT-REPRODUCED  (exit 1)   the bug is absent on this build
+
+Exit codes are deliberately NOT "0 = good". 0 means "the bug reproduced",
+because the primary caller is a fail-before check. Callers that want the
+opposite should test for exit 1 explicitly rather than assuming success==healthy.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+PWCLI = os.environ.get(
+    "PWCLI", os.path.expanduser("~/.codex/skills/playwright/scripts/playwright_cli.sh"))
+
+BENIGN_CONSOLE = [re.compile(r"favicon\.ico")]
+
+
+class Pw:
+    def __init__(self, session, workspace):
+        self.session, self.workspace = session, workspace
+
+    def __call__(self, *args, raw=False):
+        cmd = [PWCLI, "-s=" + self.session]
+        if raw:
+            cmd.append("--raw")
+        cmd += list(args)
+        r = subprocess.run(cmd, cwd=self.workspace, capture_output=True, text=True, timeout=180)
+        return r.stdout.strip()
+
+    def close(self):
+        try:
+            self("close")
+        except Exception:
+            pass
+
+
+def replay(repro, url, workspace):
+    pw = Pw("verify-%d" % os.getpid(), workspace)
+    obs = {"before": None, "after": None, "ui_status": "", "requests": "", "console": ""}
+    probe = repro["state_probe"]
+    try:
+        for step in repro["steps"]:
+            op = step["op"]
+            if op == "open":
+                pw("open", step["target"].replace("{{URL}}", url))
+            elif op == "read_state":
+                v = pw("eval", probe, raw=True).strip().strip('"')
+                obs[step["as"]] = v
+            elif op == "fill":
+                pw("fill", step["selector"], step["value"])
+            elif op == "click":
+                pw("click", step["selector"])
+            elif op == "settle":
+                time.sleep(float(step.get("seconds", 1)))
+            elif op == "read_ui_status":
+                obs["ui_status"] = pw(
+                    "eval",
+                    "() => document.querySelector('%s').textContent" % step["selector"],
+                    raw=True).strip().strip('"')
+            else:
+                raise ValueError("unknown repro op %r" % op)
+        obs["requests"] = pw("requests")
+        obs["console"] = pw("console")
+    finally:
+        pw.close()
+    return obs
+
+
+def assert_reproduced(repro, obs):
+    kind = repro["assertion"]["type"]
+
+    if kind == "state_unchanged_despite_success_ui":
+        try:
+            before, after = int(obs["before"] or 0), int(obs["after"] or 0)
+        except (TypeError, ValueError):
+            return False, "could not read authoritative state"
+        claimed = "saved" in (obs["ui_status"] or "").lower()
+        if claimed and after == before:
+            return True, "UI said %r but state stayed at %d" % (obs["ui_status"], after)
+        return False, "state moved %s -> %s (ui=%r)" % (before, after, obs["ui_status"])
+
+    if kind == "server_error_observed":
+        for line in (obs["requests"] or "").splitlines():
+            m = re.search(r"\[(\d{3})\]", line)
+            if m and int(m.group(1)) >= 500:
+                return True, line.strip()
+        return False, "no 5xx response observed"
+
+    if kind == "console_error_observed":
+        for line in (obs["console"] or "").splitlines():
+            if "[ERROR]" in line and not any(p.search(line) for p in BENIGN_CONSOLE):
+                return True, line.strip()
+        return False, "no non-benign console error observed"
+
+    return False, "unknown assertion type %r" % kind
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repro", required=True)
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--workspace", default=os.environ.get("QA_WORKSPACE", "."))
+    a = ap.parse_args()
+
+    with open(a.repro) as fh:
+        repro = json.load(fh)
+
+    obs = replay(repro, a.url, a.workspace)
+    reproduced, detail = assert_reproduced(repro, obs)
+
+    print("%s  (%s)" % ("REPRODUCED" if reproduced else "NOT-REPRODUCED", repro["reproduces"]))
+    print("  url    : %s" % a.url)
+    print("  detail : %s" % detail)
+    return 0 if reproduced else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+# acu-session — create, use and destroy isolated nested Hyprland desktops.
+#
+# Each session is a separate Hyprland compositor running as a Wayland client of
+# the host: its own wl socket, IPC instance, window graph, cursor and keyboard.
+# Agents can work in one without touching the live desktop or each other.
+#
+#   acu-session start [--name N] [--size WxH] [--host-dialogs]
+#                                               create; prints the session name
+#   acu-session list                            list live sessions
+#   acu-session info <name>                     display / signature / pid
+#   acu-session exec <name> -- <cmd...>         run a command inside the session
+#   acu-session windows <name>                  list windows in that session
+#   acu-session wait <name> --for EVENT [--match RE] [--timeout N]
+#                                               block on a compositor event
+#                                               (openwindow, closewindow,
+#                                                windowtitlev2, activewindowv2,
+#                                                or "idle" = nothing happened)
+#   acu-session capture <name> [out.png]        screenshot the session
+#   acu-session destroy <name>                  tear down, reaping orphans
+#   acu-session destroy-all
+#
+# SAFETY CONTRACT
+#   Every operation that could place a window or send input is gated on a
+#   positively-resolved session display that differs from the host's. If that
+#   cannot be established the command ABORTS. It never falls back to the host —
+#   an earlier iteration of this code read the wrong JSON key, resolved an empty
+#   display, and leaked terminals onto the live desktop.
+#
+#   Teardown escalates SIGTERM -> SIGKILL. SIGTERM removes the Hyprland IPC
+#   socket, which makes `hyprctl instances` look clean while the process is
+#   still alive, so socket absence is NOT a liveness oracle here.
+set -uo pipefail
+
+STATE_ROOT="${ACU_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/acu-sessions}"
+HOST_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+
+die() { echo "acu-session: $*" >&2; exit 1; }
+
+_instances_json() { hyprctl instances -j 2>/dev/null; }
+
+SYSTEMD_WL_BEFORE=""
+
+# Put a WORKING WAYLAND_DISPLAY *and* HYPRLAND_INSTANCE_SIGNATURE back into the
+# systemd --user manager.
+#
+# Self-healing on purpose: restoring "whatever was there before" is wrong when
+# the previous value was itself stale (e.g. a crashed earlier session left
+# wayland-2 behind). A value is only accepted if its socket actually exists;
+# otherwise we fall back to the live host display. Safe to call repeatedly.
+_restore_systemd_wayland_display() {
+  local rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" now want=""
+  now="$(systemctl --user show-environment 2>/dev/null | sed -n 's/^WAYLAND_DISPLAY=//p')"
+
+  # prefer the pre-session value, but only if its socket is real
+  if [ -n "${SYSTEMD_WL_BEFORE:-}" ] && [ -S "$rt/$SYSTEMD_WL_BEFORE" ]; then
+    want="$SYSTEMD_WL_BEFORE"
+  elif [ -n "$HOST_DISPLAY" ] && [ -S "$rt/$HOST_DISPLAY" ]; then
+    want="$HOST_DISPLAY"
+  else
+    # last resort: any live wayland socket
+    want="$(cd "$rt" 2>/dev/null && ls wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)"
+  fi
+
+  if [ -n "$want" ] && [ "$now" != "$want" ]; then
+    systemctl --user set-environment "WAYLAND_DISPLAY=$want" 2>/dev/null \
+      && echo "acu-session: restored systemd WAYLAND_DISPLAY=$want (was '${now:-unset}')" >&2
+  fi
+
+  # HYPRLAND_INSTANCE_SIGNATURE leaks the same way and was missed by the first
+  # version of this fix. Anchor it to the LONGEST-RUNNING instance: the host
+  # desktop is always older than any nested session we spawn.
+  local his_now his_want
+  his_now="$(systemctl --user show-environment 2>/dev/null \
+              | sed -n 's/^HYPRLAND_INSTANCE_SIGNATURE=//p')"
+  his_want="$(hyprctl instances -j 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+if d:
+    print(sorted(d, key=lambda i: i.get("time", 0))[0]["instance"])' 2>/dev/null)"
+  if [ -n "$his_want" ] && [ "$his_now" != "$his_want" ]; then
+    systemctl --user set-environment "HYPRLAND_INSTANCE_SIGNATURE=$his_want" 2>/dev/null \
+      && echo "acu-session: restored systemd HYPRLAND_INSTANCE_SIGNATURE (was stale)" >&2
+  fi
+}
+
+# --- session state -------------------------------------------------------
+_meta() { # name key
+  local f="$STATE_ROOT/$1/meta.json"
+  [ -f "$f" ] || return 1
+  python3 -c "
+import json,sys
+try: print(json.load(open('$f'))['$2'])
+except Exception: sys.exit(1)"
+}
+
+_alive() { # name -> 0 if compositor pid is running
+  local pid; pid="$(_meta "$1" pid)" || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# Refuse to act without a verified, non-host target.
+_require() { # name -> exports ACU_SIG / ACU_DISPLAY / ACU_PID
+  local name="$1"
+  [ -d "$STATE_ROOT/$name" ] || die "no such session: $name"
+  ACU_PID="$(_meta "$name" pid)"       || die "session $name: unreadable state"
+  ACU_SIG="$(_meta "$name" signature)" || die "session $name: unreadable state"
+  ACU_DISPLAY="$(_meta "$name" display)" || die "session $name: unreadable state"
+  [ -n "$ACU_DISPLAY" ] || die "session $name: no display resolved — refusing to act"
+  [ "$ACU_DISPLAY" = "$HOST_DISPLAY" ] && \
+    die "session $name display '$ACU_DISPLAY' == host display — refusing to act"
+  kill -0 "$ACU_PID" 2>/dev/null || die "session $name: compositor pid $ACU_PID is dead"
+  export ACU_PID ACU_SIG ACU_DISPLAY
+}
+
+# --- commands ------------------------------------------------------------
+cmd_start() {
+  local name="" size="1280x800" host_dialogs=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="${2:?--name needs a value}"; shift 2 ;;
+      --size) size="${2:?--size needs a value}"; shift 2 ;;
+      --host-dialogs) host_dialogs=1; shift ;;
+      *) die "start: unknown option $1" ;;
+    esac
+  done
+  [ -n "$name" ] || name="s$$-$(od -An -N2 -tu2 </dev/urandom | tr -d ' ')"
+  local dir="$STATE_ROOT/$name"
+  [ -d "$dir" ] && _alive "$name" && die "session $name already running"
+  mkdir -p "$dir" || die "cannot create $dir"
+
+  cat > "$dir/hypr.conf" <<EOF
+monitor = , ${size}@60, 0x0, 1
+general { border_size = 1 gaps_in = 0 gaps_out = 0 }
+decoration { blur { enabled = false } shadow { enabled = false } }
+animations { enabled = false }
+misc {
+    disable_hyprland_logo = true
+    disable_splash_rendering = true
+    force_default_wallpaper = 0
+}
+EOF
+
+  # Capture the systemd --user WAYLAND_DISPLAY before spawning anything.
+  #
+  # A nested Hyprland imports ITS OWN display into the systemd user manager on
+  # startup, clobbering the host value, and it is never restored on exit. That
+  # stale value then poisons every user service restarted afterwards.
+  #
+  # This is not hypothetical: on 2026-07-28 a nested session left
+  # WAYLAND_DISPLAY=wayland-2 behind; hours later the wallpaper timer restarted
+  # omarchy-swaybg.service, which read the stale value, could not connect, and
+  # crash-looped 334 times. Nothing of ours was still running — persistent state
+  # outlives the process that wrote it.
+  SYSTEMD_WL_BEFORE="$(systemctl --user show-environment 2>/dev/null \
+    | sed -n 's/^WAYLAND_DISPLAY=//p')"
+
+  local before
+  before="$(_instances_json | python3 -c \
+    'import sys,json;print(" ".join(str(i["pid"]) for i in json.load(sys.stdin)))')" \
+    || die "cannot query host hyprctl"
+
+  setsid env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY="$HOST_DISPLAY" \
+    Hyprland --config "$dir/hypr.conf" > "$dir/compositor.log" 2>&1 &
+
+  local i info pid sig disp
+  for i in $(seq 1 60); do
+    sleep 0.5
+    info="$(_instances_json | python3 -c "
+import sys, json
+before = set('''$before'''.split())
+new = [i for i in json.load(sys.stdin) if str(i['pid']) not in before]
+if new:
+    n = new[0]
+    # NB: the key is wl_socket. Reading 'wl socket' yields a KeyError, an empty
+    # display, and windows landing on the HOST desktop.
+    print('%s\t%s\t%s' % (n['pid'], n['instance'], n['wl_socket']))
+" 2>/dev/null)"
+    [ -n "$info" ] && break
+  done
+  [ -z "$info" ] && { rm -rf "$dir"; die "compositor failed to start (see $dir/compositor.log)"; }
+
+  pid="$(printf '%s' "$info" | cut -f1)"
+  sig="$(printf '%s' "$info" | cut -f2)"
+  disp="$(printf '%s' "$info" | cut -f3)"
+  if [ -z "$disp" ] || [ "$disp" = "$HOST_DISPLAY" ]; then
+    kill -9 "$pid" 2>/dev/null; rm -rf "$dir"
+    die "refusing session with display '$disp' (host is '$HOST_DISPLAY')"
+  fi
+
+  # A private D-Bus session bus per desktop.
+  #
+  # This is NOT optional polish. Single-instance GTK applications (ghostty,
+  # nautilus, most GApplication apps) register on the session bus; a second
+  # launch does not start a new process, it messages the FIRST one and asks it
+  # to open a window — which appears in whichever session that process lives in.
+  # Measured: starting ghostty in session B put the window in session A.
+  # Separate Wayland displays alone do not isolate these apps.
+  # The bus is started WITH THE NESTED DISPLAY in its environment, because
+  # anything it bus-activates inherits that environment. The portal
+  # (org.freedesktop.portal.Desktop) is activated on demand and renders the
+  # native file chooser; started from the host env it drew the dialog on the
+  # USER'S REAL DESKTOP while the app ran in a nested session — the dialog was
+  # both un-drivable and intrusive.
+  # --host-dialogs is a deliberate trade, not a bug:
+  #
+  #   default        native dialogs stay INSIDE the session (clean isolation),
+  #                  but driving them is currently UNVERIFIED — wtype reaches
+  #                  no window in a nested session, cause not yet found.
+  #   --host-dialogs dialogs render on the LIVE desktop, where hcu-click and
+  #                  hcu-type are measured working (7/7 and 12/12 today). You
+  #                  lose focus for a moment; you gain a drivable dialog.
+  #
+  # For serious GUI testing the proven input path beats the clean boundary.
+  local dbus_addr="" dbus_pid=""
+  local bus_wl="$disp" bus_sig="$sig"
+  if [ "$host_dialogs" = "1" ]; then
+    bus_wl="$HOST_DISPLAY"
+    bus_sig="$(hyprctl instances -j 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print(sorted(d, key=lambda i: i.get("time", 0))[0]["instance"])' 2>/dev/null)"
+  fi
+  if command -v dbus-daemon >/dev/null 2>&1; then
+    exec 8>"$dir/dbus.addr" 9>"$dir/dbus.pid"
+    env WAYLAND_DISPLAY="$bus_wl" HYPRLAND_INSTANCE_SIGNATURE="$bus_sig" \
+      XDG_CURRENT_DESKTOP=Hyprland XDG_SESSION_TYPE=wayland \
+      dbus-daemon --session --fork --print-address=8 --print-pid=9 2>/dev/null
+    exec 8>&- 9>&-
+    dbus_addr="$(cat "$dir/dbus.addr" 2>/dev/null | tr -d '\n')"
+    dbus_pid="$(cat "$dir/dbus.pid" 2>/dev/null | tr -d '\n')"
+  fi
+  [ -n "$dbus_addr" ] || echo "acu-session: WARNING: no private D-Bus for $name — single-instance apps may leak between sessions" >&2
+
+  # Undo the systemd-environment clobber immediately, not at teardown. Nothing
+  # here depends on the manager holding the nested value — every command we run
+  # gets WAYLAND_DISPLAY passed explicitly — so the correct window of exposure
+  # is seconds, not the lifetime of the session (or forever, if it crashes).
+  _restore_systemd_wayland_display
+
+  ADDR="$dbus_addr" DPID="${dbus_pid:-0}" WLBEFORE="$SYSTEMD_WL_BEFORE" python3 -c "
+import json, os
+json.dump({'name':'$name','pid':$pid,'signature':'$sig','display':'$disp','size':'$size',
+           'dbus_address':os.environ.get('ADDR',''),'dbus_pid':int(os.environ.get('DPID') or 0),
+           'systemd_wayland_display_before':os.environ.get('WLBEFORE','')},
+          open('$dir/meta.json','w'), indent=2)"
+  echo "$name"
+}
+
+cmd_list() {
+  [ -d "$STATE_ROOT" ] || { echo "(no sessions)"; return 0; }
+  local any=0 d n
+  for d in "$STATE_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    if _alive "$n"; then
+      printf '%-22s display=%-10s pid=%-8s %s\n' "$n" \
+        "$(_meta "$n" display)" "$(_meta "$n" pid)" "$(_meta "$n" size)"
+      any=1
+    else
+      printf '%-22s (dead — run destroy to clean up)\n' "$n"; any=1
+    fi
+  done
+  [ "$any" -eq 0 ] && echo "(no sessions)"
+  return 0
+}
+
+cmd_info() { _require "$1"; printf 'name=%s\ndisplay=%s\nsignature=%s\npid=%s\n' \
+  "$1" "$ACU_DISPLAY" "$ACU_SIG" "$ACU_PID"; }
+
+cmd_exec() {
+  local name="$1"; shift
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die "exec: no command given"
+  _require "$name"
+  local dbus; dbus="$(_meta "$name" dbus_address 2>/dev/null || true)"
+  if [ -n "$dbus" ]; then
+    WAYLAND_DISPLAY="$ACU_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE="$ACU_SIG" \
+      DBUS_SESSION_BUS_ADDRESS="$dbus" setsid "$@" >/dev/null 2>&1 &
+  else
+    WAYLAND_DISPLAY="$ACU_DISPLAY" HYPRLAND_INSTANCE_SIGNATURE="$ACU_SIG" \
+      setsid "$@" >/dev/null 2>&1 &
+  fi
+  echo "$!"
+}
+
+cmd_windows() {
+  _require "$1"
+  HYPRLAND_INSTANCE_SIGNATURE="$ACU_SIG" hyprctl clients -j 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+for c in d:
+    print("%s  pid=%-8s %-28s %s" % (c["address"], c["pid"], c["class"], c["title"][:50]))
+print("(%d windows)" % len(d))'
+}
+
+# Block until the compositor says something happened, instead of sleeping.
+#
+# Hyprland pushes state changes on .socket2.sock. Polling with `sleep N` is
+# both slower and less reliable: this rig lost real time to sleeps that were
+# too short (a capture recorded "no change" seconds before the response
+# arrived) and too long (12s settles on every control in a sweep).
+#
+# An event that fires in 200ms is observed in 200ms; one that never fires
+# fails at the timeout with a named reason rather than a silent wrong answer.
+cmd_wait() {
+  local name="$1"; shift
+  local ev="openwindow" match="" timeout=30 quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --for)     ev="${2:?--for needs an event}"; shift 2 ;;
+      --match)   match="${2:?--match needs a regex}"; shift 2 ;;
+      --timeout) timeout="${2:?--timeout needs seconds}"; shift 2 ;;
+      --quiet)   quiet=1; shift ;;
+      *) die "wait: unknown option $1" ;;
+    esac
+  done
+  _require "$name"
+  local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr/$ACU_SIG/.socket2.sock"
+  [ -S "$sock" ] || die "wait: no event socket for session $name"
+
+  EV="$ev" MATCH="$match" TMO="$timeout" QUIET="$quiet" SOCK="$sock" python3 -c '
+import os, re, socket, sys, time
+
+sock, ev = os.environ["SOCK"], os.environ["EV"]
+match = os.environ.get("MATCH") or ""
+tmo = float(os.environ["TMO"])
+quiet = os.environ["QUIET"] == "1"
+rx = re.compile(match) if match else None
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(tmo)
+try:
+    s.connect(sock)
+except OSError as e:
+    print("wait: cannot connect to event socket: %s" % e, file=sys.stderr)
+    sys.exit(3)
+
+deadline = time.time() + tmo
+buf = b""
+# "idle" is its own thing: wait for QUIET, not for a specific event.
+idle_mode = (ev == "idle")
+last_event = time.time()
+
+while True:
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        if idle_mode:
+            sys.exit(0)  # stayed quiet the whole time — that IS the success case
+        print("wait: timed out after %ss waiting for %s" % (tmo, ev), file=sys.stderr)
+        sys.exit(1)
+    s.settimeout(min(remaining, 0.5))
+    try:
+        chunk = s.recv(8192)
+    except socket.timeout:
+        if idle_mode and (time.time() - last_event) >= 1.5:
+            sys.exit(0)
+        continue
+    if not chunk:
+        break
+    buf += chunk
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
+        text = line.decode("utf-8", "replace")
+        last_event = time.time()
+        if idle_mode:
+            continue
+        name_, _, data = text.partition(">>")
+        if name_ != ev:
+            continue
+        if rx and not rx.search(data):
+            continue
+        if not quiet:
+            print(text)
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+cmd_capture() {
+  local name="$1" out="${2:-acu-$1-$(od -An -N2 -tu2 </dev/urandom | tr -d ' ').png}"
+  _require "$name"
+  command -v grim >/dev/null || die "grim not installed"
+
+  local t="${ACU_CAPTURE_TIMEOUT:-10}"
+
+  # PRE-FLIGHT: pixel capture needs a PRESENTED output somewhere up the chain.
+  #
+  # A nested session always reports its own virtual output, so checking the
+  # session's monitor list is not sufficient. What actually matters is the HOST:
+  # with the monitor physically off every DRM connector reads `disconnected`,
+  # Hyprland drops the output and `hyprctl monitors` returns an empty list. The
+  # nested compositor's surface is then never presented, it receives no frame
+  # callbacks, never renders, and wlr-screencopy blocks forever waiting for a
+  # frame that cannot arrive.
+  #
+  # This is NOT DPMS — `dpms on` does not help, there is nothing to wake. There
+  # is no remote workaround (headless output stays 0x0 on 0.54.3; cage cannot
+  # take the DRM device Hyprland holds).
+  #
+  # Structured channels (hyprctl clients, CDP, the filesystem) keep working in
+  # that state — which is precisely why pixels are the last-resort oracle.
+  local host_outputs
+  host_outputs="$(hyprctl monitors -j 2>/dev/null | python3 -c \
+    'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+  if [ "${host_outputs:-0}" -eq 0 ]; then
+    die "cannot capture: host has no active output (monitor off / disconnected).
+     Nested sessions render only while the host display is presented.
+     Use structured oracles instead: 'acu-session windows', hyprctl state, or CDP."
+  fi
+
+  if timeout "$t" env WAYLAND_DISPLAY="$ACU_DISPLAY" grim "$out" 2>/dev/null && [ -s "$out" ]; then
+    echo "$out"; return 0
+  fi
+
+  # Retry once after provoking damage — an idle compositor may also be sitting
+  # on no pending frame.
+  HYPRLAND_INSTANCE_SIGNATURE="$ACU_SIG" hyprctl dispatch forcerendererreload >/dev/null 2>&1 || true
+  sleep 0.5
+  if timeout "$t" env WAYLAND_DISPLAY="$ACU_DISPLAY" grim "$out" 2>/dev/null && [ -s "$out" ]; then
+    echo "$out"; return 0
+  fi
+
+  # A nested compositor parked on a HIDDEN workspace is never presented, so it
+  # gets no frame callbacks, never renders, and screencopy blocks. That is the
+  # normal state here: the recommended window rule routes agent desktops to
+  # `special:agent` so they cannot steal focus. The two goals genuinely conflict
+  # on 0.54.3, where a headless output cannot be given a mode (it stays 0x0).
+  #
+  # Resolution: briefly reveal, capture, hide again — roughly a one-second
+  # flicker of the special workspace. Unavoidable while pixels require
+  # presentation. Structured oracles (`windows`, hyprctl, CDP) need none of it.
+  local win_ws special rc
+  win_ws="$(hyprctl clients -j 2>/dev/null | python3 -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = []
+for c in d:
+    if c.get('class') == 'aquamarine' and str(c.get('pid')) == '$ACU_PID':
+        print(c['workspace']['name']); break" 2>/dev/null)"
+
+  case "${win_ws:-}" in
+    special*)
+      # Move THIS session's window to the visible workspace, capture, move it
+      # back. Toggling the whole special workspace was too coarse: every agent
+      # desktop lands on `special:agent`, so a toggle reveals all of them at
+      # once and the capture can target the wrong presentation. Measured — a
+      # second live session broke a previously-passing capture.
+      local cur addr rc=1
+      cur="$(hyprctl activeworkspace -j 2>/dev/null \
+             | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])' 2>/dev/null)"
+      addr="$(hyprctl clients -j 2>/dev/null | python3 -c "
+import sys, json
+for c in json.load(sys.stdin):
+    if c.get('class') == 'aquamarine' and str(c.get('pid')) == '$ACU_PID':
+        print(c['address']); break" 2>/dev/null)"
+      if [ -n "$addr" ] && [ -n "$cur" ]; then
+        hyprctl dispatch movetoworkspacesilent "$cur,address:$addr" >/dev/null 2>&1
+        sleep 0.9
+        timeout "$t" env WAYLAND_DISPLAY="$ACU_DISPLAY" grim "$out" 2>/dev/null \
+          && [ -s "$out" ] && rc=0
+        hyprctl dispatch movetoworkspacesilent "$win_ws,address:$addr" >/dev/null 2>&1
+      fi
+      [ "$rc" -eq 0 ] && { echo "$out"; return 0; }
+      ;;
+  esac
+
+  rm -f "$out"
+  die "capture produced no frame within ${t}s (compositor idle, hidden, or output not presented)"
+}
+
+cmd_destroy() {
+  local name="$1"
+  local dir="$STATE_ROOT/$name"
+  [ -d "$dir" ] || die "no such session: $name"
+  local pid dbus_pid
+  pid="$(_meta "$name" pid 2>/dev/null || true)"
+  dbus_pid="$(_meta "$name" dbus_pid 2>/dev/null || true)"
+  # Recorded at start; used for the post-reap restore at the end of teardown.
+  SYSTEMD_WL_BEFORE="$(_meta "$name" systemd_wayland_display_before 2>/dev/null || true)"
+
+  if [ -n "$dbus_pid" ] && [ "$dbus_pid" != "0" ]; then
+    kill "$dbus_pid" 2>/dev/null
+    sleep 0.2
+    kill -0 "$dbus_pid" 2>/dev/null && kill -9 "$dbus_pid" 2>/dev/null
+  fi
+
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    local i
+    for i in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+    # SIGTERM drops the IPC socket but can leave the process running.
+    kill -0 "$pid" 2>/dev/null && { kill -9 "$pid" 2>/dev/null; sleep 0.3; }
+  fi
+  # reap anything still bound to this session's config
+  pkill -9 -f "Hyprland --config $dir/hypr.conf" 2>/dev/null
+  rm -rf "$dir"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    die "session $name: pid $pid survived SIGKILL"
+  fi
+  # Only now is it safe: restoring before the compositor is reaped loses the
+  # race, because a shutting-down instance re-imports its own display.
+  _restore_systemd_wayland_display
+  echo "destroyed $name"
+}
+
+cmd_destroy_all() {
+  [ -d "$STATE_ROOT" ] || { echo "(nothing to destroy)"; return 0; }
+  local d n rc=0
+  for d in "$STATE_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    cmd_destroy "$n" || rc=1
+  done
+  return $rc
+}
+
+case "${1:-}" in
+  start)       shift; cmd_start "$@" ;;
+  list)        cmd_list ;;
+  info)        shift; cmd_info "${1:?info needs a session name}" ;;
+  exec)        shift; cmd_exec "${1:?exec needs a session name}" "${@:2}" ;;
+  windows)     shift; cmd_windows "${1:?windows needs a session name}" ;;
+  wait)        shift; cmd_wait "${1:?wait needs a session name}" "${@:2}" ;;
+  capture)     shift; cmd_capture "${1:?capture needs a session name}" "${2:-}" ;;
+  destroy)     shift; cmd_destroy "${1:?destroy needs a session name}" ;;
+  destroy-all) cmd_destroy_all ;;
+  ""|-h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac

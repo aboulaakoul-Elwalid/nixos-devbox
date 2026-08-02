@@ -1,0 +1,75 @@
+{
+  "url": "http://127.0.0.1:8940",
+  "persona": "You are a real person using a small web app to jot down quick notes. Behave like an ordinary user: write the sort of short, natural notes a person actually writes during a busy day. Vary your wording between notes. You are not testing the app and you know nothing about its internals.",
+  "model": "opencode/deepseek-v4-flash-free",
+  "steps": [
+    {
+      "n": 1,
+      "action": {
+        "action": "type_and_save",
+        "text": "Buy milk and eggs on the way back",
+        "why": "quick reminder for groceries"
+      },
+      "notes_before": "0",
+      "ui_status": "Saved!",
+      "notes_after": "1"
+    },
+    {
+      "n": 2,
+      "action": {
+        "action": "type_and_save",
+        "text": "Call dentist to reschedule Wednesday appointment",
+        "why": "need to move the appointment since I have a meeting that day"
+      },
+      "notes_before": "1",
+      "ui_status": "Saved!",
+      "notes_after": "2"
+    },
+    {
+      "n": 3,
+      "action": {
+        "action": "type_and_save",
+        "text": "Send the draft contract to Sarah by Friday EOD",
+        "why": "work follow-up for client contract deadline"
+      },
+      "notes_before": "2",
+      "ui_status": "Saved!",
+      "notes_after": "3"
+    },
+    {
+      "n": 4,
+      "action": {
+        "action": "type_and_save",
+        "text": "Pick up prescription from pharmacy before it closes at 8",
+        "why": "natural errand reminder after the other daily tasks"
+      },
+      "notes_before": "3",
+      "ui_status": "Saved!",
+      "notes_after": "4"
+    },
+    {
+      "n": 5,
+      "action": {
+        "action": "type_and_save",
+        "text": "Ask IT about the VPN issue \u2014 keeps dropping during morning standup",
+        "why": "A quick practical note about a recurring work annoyance, fits the pattern of real-life jottings"
+      },
+      "notes_before": "4",
+      "ui_status": "Saved!",
+      "notes_after": "5"
+    }
+  ],
+  "notes_written": [
+    "Buy milk and eggs on the way back",
+    "Call dentist to reschedule Wednesday appointment",
+    "Send the draft contract to Sarah by Friday EOD",
+    "Pick up prescription from pharmacy before it closes at 8",
+    "Ask IT about the VPN issue \u2014 keeps dropping during morning standup"
+  ],
+  "requests_raw": "### Result\n2. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n3. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n4. [POST] http://127.0.0.1:8940/api/notes => [201] Created\n5. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n6. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n7. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n8. [POST] http://127.0.0.1:8940/api/notes => [201] Created\n9. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n10. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n11. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n12. [POST] http://127.0.0.1:8940/api/notes => [201] Created\n13. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n14. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n15. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n16. [POST] http://127.0.0.1:8940/api/notes => [201] Created\n17. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n18. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n19. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n20. [POST] http://127.0.0.1:8940/api/notes => [201] Created\n21. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n22. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n23. [GET] http://127.0.0.1:8940/api/notes => [200] OK\n\nNote: 1 static request not shown, run with --static option to see it.",
+  "console_raw": "### Result\nTotal messages: 1 (Errors: 1, Warnings: 0)\n\n[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8940/favicon.ico:0",
+  "verdict": {
+    "bug": false,
+    "findings": []
+  }
+}

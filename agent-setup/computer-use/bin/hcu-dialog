@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# hcu-dialog — drive a native GTK file chooser by POINTER.
+#
+#   hcu-dialog find                  is a chooser open? print its geometry
+#   hcu-dialog shot [out.png]        screenshot it (to pick a row by eye)
+#   hcu-dialog at <x> <y>            click a point read off `shot` (preferred)
+#   hcu-dialog at <x> <y> double     double-click it (descend / open)
+#   hcu-dialog row <n>               nth file row — see the caveat below
+#   hcu-dialog sidebar <n>           click the nth sidebar place
+#   hcu-dialog select | cancel       confirm or dismiss
+#
+# If more than one chooser is open the tool REFUSES rather than guessing which
+# one you meant — driving the wrong dialog silently is worse than stopping.
+# HCU_DIALOG_MATCH=<title substring> names one explicitly. Known limit: when two
+# choosers are tiled and overlapping, a click aimed at the background one can be
+# consumed as a focus event; close or cancel them one at a time.
+#
+# WHY POINTER AND NOT KEYBOARD  (measured 2026-07-28, Hyprland 0.54.3, GTK3
+# portal backend, in a clean single-dialog environment)
+#
+#   pointer: row click + Select      -> 3/3 confirmed
+#   keyboard: Ctrl+L, type, Enter    -> 0/5 confirmed
+#
+# Keyboard input DOES reach these dialogs — Ctrl+L opens the location bar and
+# typed characters appear — so "GTK ignores virtual keyboards" is NOT the
+# explanation. Three separate defects make the location bar unusable:
+#
+#   1. Characters drop. "/etc/hostname" repeatedly landed as "/tc/hostname".
+#      The same string types perfectly into a terminal on the same seat, so
+#      hcu-type is not at fault; "/" is itself a chooser shortcut that reopens
+#      the location entry and eats the following keystroke.
+#   2. The entry is remembered across dialog sessions, so a fresh dialog can
+#      open holding a previous path and new text merges into it.
+#   3. Return does not commit the entry. Only clicking Select does.
+#
+# So: navigate by pointer. Choosing a row means seeing the dialog first —
+# `hcu-dialog shot`, read the row's y off the image, then `hcu-dialog at X Y`.
+#
+# COORDINATES. `shot` crops to the dialog, so pixels in that image are already
+# window-relative and `at` consumes them directly. The sidebar is stable across
+# views (first place 69px down, 38px pitch, verified). The FILE LIST is not:
+# its origin shifts when a breadcrumb bar appears, so prefer `at`.
+set -uo pipefail
+
+ROW0="${HCU_DIALOG_ROW0:-84}"
+PITCH="${HCU_DIALOG_PITCH:-24}"
+SIDE0="${HCU_DIALOG_SIDE0:-69}"
+SIDEPITCH="${HCU_DIALOG_SIDEPITCH:-38}"
+
+die() { echo "hcu-dialog: $*" >&2; exit 1; }
+
+# hcu-click is this tool's ONLY way to act, and it is NOT on PATH by default —
+# it ships in the sibling hyprland-computer-use skill. Calling it bare meant a
+# gesture failed halfway with "command not found", leaving a real dialog open in
+# a half-driven state that the caller then had to untangle. Resolve it ONCE, up
+# front, and refuse to start without it: a tool that cannot act must say so
+# before it touches anything, not partway through.
+_resolve_click() {
+  local c
+  for c in "${HCU_CLICK:-}" \
+           "$(command -v hcu-click 2>/dev/null)" \
+           "$(dirname "$0")/hcu-click" \
+           "$HOME/.agents/skills/hyprland-computer-use/bin/hcu-click" \
+           "$HOME/.claude/skills/hyprland-computer-use/bin/hcu-click"; do
+    [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+CLICK="$(_resolve_click)" || die "cannot find hcu-click (set HCU_CLICK, or install the hyprland-computer-use skill) — refusing to act"
+
+# Match on the portal backend's window class. Titles are caller-supplied and
+# localised, so they are not a dependable handle.
+# FAIL-CLOSED TARGETING. Picking "the first portal window" silently drives the
+# wrong dialog when more than one is open — that bug corrupted a whole round of
+# measurements here: clicks landed on one chooser while the confirm went to
+# another, and the results looked like flaky input. If the target is ambiguous,
+# refuse. HCU_DIALOG_MATCH=<title substring> disambiguates deliberately.
+_geo() {
+  hyprctl clients -j 2>/dev/null | MATCH="${HCU_DIALOG_MATCH:-}" python3 -c '
+import sys, json, os
+try: d = json.load(sys.stdin)
+except Exception: d = []
+m = os.environ.get("MATCH", "")
+c = [w for w in d if "portal" in w.get("class", "").lower()]
+if m:
+    c = [w for w in c if m in w.get("title", "")]
+if not c:
+    sys.exit(1)
+if len(c) > 1:
+    sys.stderr.write("AMBIGUOUS %d %s\n" % (len(c), " | ".join(repr(w.get("title","")) for w in c)))
+    sys.exit(2)
+w = c[0]
+print("%d %d %d %d" % (w["at"][0], w["at"][1], w["size"][0], w["size"][1]))
+'
+}
+
+_addr() {
+  hyprctl clients -j 2>/dev/null | MATCH="${HCU_DIALOG_MATCH:-}" python3 -c '
+import sys, json, os
+try: d = json.load(sys.stdin)
+except Exception: d = []
+m = os.environ.get("MATCH", "")
+c = [w for w in d if "portal" in w.get("class", "").lower()]
+if m: c = [w for w in c if m in w.get("title", "")]
+print(c[0]["address"] if len(c) == 1 else "")
+' 2>/dev/null
+}
+
+# Geometry must be four integers. Without this check an empty $g silently
+# becomes 0,0,0,0 and clicks land at negative coordinates — which is how the
+# ambiguity guard first appeared to pass while still clicking.
+_split_geo() {
+  read -r x y w h <<< "$1"
+  local v
+  for v in "$x" "$y" "$w" "$h"; do
+    case "$v" in
+      ''|*[!0-9-]*) die "bad dialog geometry [$1] — refusing to click" ;;
+    esac
+  done
+  [ "$w" -gt 0 ] && [ "$h" -gt 0 ] || die "bad dialog size [$1] — refusing to click"
+}
+
+_need() {
+  local g rc
+  g="$(_geo 2>/tmp/hcu-dialog.err)"; rc=$?
+  if [ "$rc" -eq 2 ]; then
+    die "$(sed -n 's/^AMBIGUOUS \([0-9]*\) /\1 file choosers are open, refusing to guess: /p' /tmp/hcu-dialog.err)
+     set HCU_DIALOG_MATCH=<title substring> to name the one you mean."
+  fi
+  [ "$rc" -ne 0 ] && die "no file chooser is open"
+  [ -n "$g" ] || die "no file chooser is open"
+  # Focus explicitly rather than assuming the dialog holds it; a click into an
+  # unfocused window would otherwise only raise it.
+  local a; a="$(_addr)"
+  [ -n "$a" ] || die "could not resolve the dialog window"
+  hyprctl dispatch focuswindow "address:$a" >/dev/null 2>&1
+  # Focus alone does not restack a floating dialog, so an overlapping chooser
+  # can still eat the click. Raise it explicitly.
+  hyprctl dispatch alterzorder top,"address:$a" >/dev/null 2>&1
+  sleep 0.4
+  # Park the pointer inside the dialog before the real click. Entering a window
+  # and pressing in one motion lets click-to-focus swallow the press as an
+  # activation event — measured: the first Cancel click did nothing, the second
+  # closed the dialog.
+  read -r _gx _gy _gw _gh <<< "$g"
+  hyprctl dispatch movecursor $(( _gx + _gw / 2 )) $(( _gy + _gh / 2 )) >/dev/null 2>&1
+  sleep 0.2
+  echo "$g"
+}
+
+cmd_find() {
+  local g rc
+  g="$(_geo 2>/tmp/hcu-dialog.err)"; rc=$?
+  [ "$rc" -eq 2 ] && { cat /tmp/hcu-dialog.err; return 2; }
+  [ "$rc" -ne 0 ] && { echo "no chooser open"; return 1; }
+  read -r x y w h <<< "$g"
+  echo "chooser at ${x},${y} size ${w}x${h}"
+}
+
+cmd_shot() {
+  local out="${1:-/tmp/hcu-dialog.png}" g; g="$(_need)" || exit 1
+  _split_geo "$g"
+  grim -g "$x,$y ${w}x${h}" "$out" || die "capture failed"
+  echo "$out $x,$y ${w}x${h}"
+}
+
+# Click a point read straight off `hcu-dialog shot`. The shot is cropped to the
+# window, so its pixel coordinates ARE window-relative — no scaling math for the
+# caller, and no assumption about the dialog's position on screen.
+cmd_at() { # rx ry [double]
+  local rx="${1:?usage: hcu-dialog at <x> <y>}" ry="${2:?usage: hcu-dialog at <x> <y>}"
+  local g; g="$(_need)" || exit 1
+  _split_geo "$g"
+  { [ "$rx" -lt 0 ] || [ "$ry" -lt 0 ] || [ "$rx" -ge "$w" ] || [ "$ry" -ge "$h" ]; } \
+    && die "point ${rx},${ry} is outside the dialog (${w}x${h})"
+  "$CLICK" $(( x + rx )) $(( y + ry ))
+  if [ "${3:-}" = "double" ]; then sleep 0.15; "$CLICK" $(( x + rx )) $(( y + ry )); fi
+  echo "clicked ${rx},${ry} (abs $(( x + rx )),$(( y + ry )))"
+}
+
+# Row indexing is a convenience ONLY. The list origin MOVES between views: the
+# "Recent" landing view starts at y=84, but once you navigate anywhere a
+# breadcrumb bar appears and pushes the first row to y=131. Measured the hard
+# way — asking for row 4 in a browse view selected row 2. Pass the right origin
+# via HCU_DIALOG_ROW0, or use `at` with coordinates read off `shot`.
+cmd_row() { # n [double]
+  local n="${1:?usage: hcu-dialog row <n>}" g; g="$(_need)" || exit 1
+  _split_geo "$g"
+  local cx=$(( x + 250 ))
+  local cy=$(( y + ROW0 + (n - 1) * PITCH ))
+  [ "$cy" -ge $(( y + h )) ] && die "row $n is below the window (y=$cy, bottom=$(( y + h )))"
+  "$CLICK" "$cx" "$cy"
+  if [ "${2:-}" = "double" ]; then sleep 0.15; "$CLICK" "$cx" "$cy"; fi
+  echo "clicked row $n at ${cx},${cy} (row0=$ROW0 pitch=$PITCH)"
+}
+
+cmd_sidebar() {
+  local n="${1:?usage: hcu-dialog sidebar <n>}" g; g="$(_need)" || exit 1
+  _split_geo "$g"
+  local cx=$(( x + 70 ))
+  local cy=$(( y + SIDE0 + (n - 1) * SIDEPITCH ))
+  "$CLICK" "$cx" "$cy"
+  echo "clicked sidebar $n at ${cx},${cy}"
+}
+
+# Select sits top-right, Cancel top-left, both on the header bar.
+cmd_button() { # select|cancel
+  local which="$1" g; g="$(_need)" || exit 1
+  _split_geo "$g"
+  local cx cy=$(( y + 22 ))
+  if [ "$which" = "select" ]; then cx=$(( x + w - 47 )); else cx=$(( x + 45 )); fi
+  "$CLICK" "$cx" "$cy"
+  sleep 0.8
+  if _geo >/dev/null 2>&1; then
+    echo "clicked $which at ${cx},${cy} — dialog STILL OPEN"
+    return 1
+  fi
+  echo "clicked $which at ${cx},${cy} — dialog closed"
+}
+
+case "${1:-}" in
+  find)    shift; cmd_find "$@" ;;
+  shot)    shift; cmd_shot "$@" ;;
+  at)      shift; cmd_at "$1" "$2" "${3:-}" ;;
+  row)     shift; cmd_row "$1" "${2:-}" ;;
+  open)    shift; cmd_row "$1" double ;;
+  sidebar) shift; cmd_sidebar "$@" ;;
+  select)  cmd_button select ;;
+  cancel)  cmd_button cancel ;;
+  ""|-h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac
