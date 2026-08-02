@@ -27,7 +27,8 @@
 				# home.username in ../home-manager/home.nix.
 				home-manager.useGlobalPkgs = true;
 				home-manager.useUserPackages = true;
-				home-manager.users.elwalid = import ../home-manager/home.nix;
+				home-manager.sharedModules = [ omanix.homeManagerModules.default ];
+					home-manager.users.elwalid = import ../home-manager/home.nix;
 			})
 			];
 		};
