@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# verify — one entry point for verifying an app you built, by actually driving it.
+#
+#   verify doctor                    are the preconditions met? (run this first)
+#   verify web    <url>              sweep every control; report what broke
+#   verify app    <url> [--scenario] run the oracle on a scenario
+#   verify editor <ext-dir> [ws] [--keep]   launch a VS Code extension
+#   verify observe | click "<label>" | key <chord> | type <text> | stop
+#                                    interact with a --keep editor
+#   verify dialog <find|shot|at|sidebar|select|cancel> [args]
+#   verify repro  <repro.json> <url> replay a saved finding
+#
+#   verify <url>                     shorthand — routes to `app`
+#   verify <extension-dir>           shorthand — routes to `editor`
+#
+# Add --json to any command for machine-readable output.
+#
+# WHY THIS EXISTS
+#   The capabilities underneath were built and measured separately, and ended up
+#   as ~20 entry points across four directories with three different invocation
+#   conventions — `uv run --with websockets qa/bin/qa-vscode`,
+#   `QA_WORKSPACE=... qa/bin/qa-run`, `pw-init` first, and so on. None of that is
+#   guessable. This script owns all of it so a caller needs to know one command.
+#
+#   It deliberately does NOT reimplement any checking. Every verdict below comes
+#   from a tool with its own gate (oracle 6/6, repro 9/9, dialog 3/3); this is a
+#   dispatcher and a summariser, so there is exactly one place to fix an
+#   interface without touching measured behaviour.
+set -uo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# The heavy tools live in the working repo, not in the skill: they carry their
+# own test gates and change independently. The skill is the interface, and it
+# blocks with a named path if that repo is absent rather than half-working.
+REPO="${COMPUTER_USE_REPO:-$HOME/projects/computer_use}"
+JSON=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- ${ARGS+"${ARGS[@]}"}
+
+# hcu-dialog's only way to act is hcu-click, which lives in the sibling
+# hyprland-computer-use skill and is NOT on PATH. Without this, a dialog gesture
+# died halfway with "command not found" and left a real chooser half-driven.
+for _b in "$HOME/.agents/skills/hyprland-computer-use/bin" \
+          "$(dirname "$0")/../../hyprland-computer-use/bin"; do
+  [ -d "$_b" ] && case ":$PATH:" in *":$_b:"*) ;; *) PATH="$_b:$PATH" ;; esac
+done
+export PATH
+
+die() { echo "verify: $*" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+[ -d "$REPO" ] || die "toolchain repo not found at $REPO (set COMPUTER_USE_REPO)"
+
+# qa-vscode needs the `websockets` package. Resolve ONE runner here instead of
+# making every caller remember `uv run --with websockets`.
+_py_runner() {
+  if python3 -c "import websockets" >/dev/null 2>&1; then
+    echo "python3"
+  elif have uv; then
+    echo "uv run --with websockets python3"
+  else
+    return 1
+  fi
+}
+
+# playwright-cli needs a NixOS-specific workspace built by pw-init. Build it
+# once per user and reuse; a missing workspace is a hard blocker, not a fallback.
+_workspace() {
+  local ws="${QA_WORKSPACE:-$HOME/.cache/verify/pw-ws}"
+  if [ ! -d "$ws" ]; then
+    mkdir -p "$(dirname "$ws")"
+    "$REPO/bin/pw-init" "$ws" >/dev/null 2>&1 || return 1
+  fi
+  echo "$ws"
+}
+
+# Anything printed alongside a --json verdict would make the output unparseable,
+# so extras (like a trace path) go INSIDE the object rather than beside it.
+_emit() { # verdict, count, detail-lines-file, [extra-key], [extra-value]
+  local verdict="$1" count="$2" detail="${3:-/dev/null}"
+  local ekey="${4:-}" eextra="${5:-}"
+  if [ "$JSON" = "1" ]; then
+    python3 - "$verdict" "$count" "$detail" "$ekey" "$eextra" <<'PY'
+import json, sys
+v, n, path, ekey, eextra = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+try:
+    lines = [l.rstrip("\n") for l in open(path) if l.strip()]
+except OSError:
+    lines = []
+out = {"verdict": v, "findings": n, "detail": lines}
+if ekey:
+    out[ekey] = eextra
+print(json.dumps(out))
+PY
+  else
+    echo "VERDICT: $verdict ($count finding$([ "$count" = "1" ] || echo s))"
+    [ -s "$detail" ] && sed 's/^/  /' "$detail"
+    [ -n "$ekey" ] && echo "$ekey: $eextra"
+  fi
+}
+
+# --- doctor ---------------------------------------------------------------
+cmd_doctor() {
+  local bad=0 runner
+  printf '%-22s %s\n' "toolchain repo" "$REPO"
+  for t in hyprctl grim wtype wlrctl chromium; do
+    if have "$t"; then printf '%-22s ok\n' "$t"
+    else printf '%-22s MISSING\n' "$t"; bad=1; fi
+  done
+  if runner="$(_py_runner)"; then printf '%-22s %s\n' "python websockets" "$runner"
+  else printf '%-22s MISSING (need uv or the websockets package)\n' "python websockets"; bad=1; fi
+  local ws; if ws="$(_workspace)"; then printf '%-22s %s\n' "playwright workspace" "$ws"
+  else printf '%-22s FAILED (pw-init)\n' "playwright workspace"; bad=1; fi
+  for f in qa/bin/qa-run qa/bin/qa-vscode qa/sweep-web.sh; do
+    if [ -x "$REPO/$f" ]; then printf '%-22s ok\n' "$(basename "$f")"
+    else printf '%-22s MISSING in repo\n' "$(basename "$f")"; bad=1; fi
+  done
+  # Checking that hcu-dialog EXISTS said "ok" while its runtime dependency was
+  # unreachable, so the first real click failed mid-gesture. Execute it instead:
+  # with no chooser open it should exit 1 saying exactly that. Any other message
+  # means it cannot act, and "ok" would be a lie.
+  local dout; dout="$("$REPO/bin/hcu-dialog" find 2>&1)"
+  if printf '%s' "$dout" | grep -q "no chooser open"; then
+    printf '%-22s ok (runs; %s)\n' "hcu-dialog" "$(command -v hcu-click || echo 'hcu-click resolved internally')"
+  elif printf '%s' "$dout" | grep -q "chooser at"; then
+    printf '%-22s ok (a chooser is open right now)\n' "hcu-dialog"
+  else
+    printf '%-22s CANNOT RUN: %s\n' "hcu-dialog" "$(printf '%s' "$dout" | head -1)"; bad=1
+  fi
+  # A capture channel that silently blocks forever is worse than one that is
+  # absent: grim hangs when every DRM connector reads disconnected (monitor off).
+  if hyprctl monitors -j 2>/dev/null | grep -q '"disabled": *false'; then
+    printf '%-22s ok\n' "display (capture)"
+  else
+    printf '%-22s NO ACTIVE OUTPUT — screenshots will block; structured checks still work\n' "display (capture)"
+  fi
+  [ "$bad" = 0 ] && echo "doctor: ready" || { echo "doctor: BLOCKED (see MISSING above)"; return 1; }
+}
+
+# --- web sweep ------------------------------------------------------------
+cmd_web() {
+  local url="${1:?usage: verify web <url>}" max="${2:-8}"
+  local ws; ws="$(_workspace)" || die "could not build a playwright workspace"
+  local out; out="$(mktemp)"; local raw; raw="$(mktemp)"
+  QA_WORKSPACE="$ws" "$REPO/qa/sweep-web.sh" "$url" "$max" >"$raw" 2>&1
+  # sweep-web prints a table plus a trailing "controls swept: N | findings: N".
+  local total; total="$(sed -n 's/.*findings: \([0-9]*\).*/\1/p' "$raw" | tail -1)"
+  [ -z "$total" ] && { cat "$raw"; rm -f "$out" "$raw"; die "sweep produced no verdict line"; }
+
+  # Split the sweep's two signal classes. An HTTP 5xx or a console error is
+  # evidence of a defect. "NO RESPONSE" is NOT: the sweep clicks every control
+  # blind, so a Save button with an empty form legitimately does nothing — that
+  # fired on a KNOWN-GOOD build here. Counting it as a bug is how a harness
+  # earns a reputation for crying wolf and stops being read.
+  grep -E "console err|http 4xx/5xx" "$raw" | grep -v "clean" >"$out"
+  local n; n="$(wc -l <"$out" | tr -d ' ')"
+  local quiet; quiet="$(grep -c "NO RESPONSE" "$raw" 2>/dev/null || echo 0)"
+
+  # An "ok" here means only "no control errored on a blind click". Measured: the
+  # sweep is SILENT on a build with a known 500, because it clicks Save with an
+  # empty form and never types the input that triggers it. Saying so in the
+  # verdict itself is the difference between a smoke test and a false all-clear.
+  _emit "$([ "$n" = "0" ] && echo ok || echo findings)" "$n" "$out" \
+        scope "control-sweep only — no data entered; run 'verify app' for scenario bugs"
+  if [ "${quiet:-0}" -gt 0 ] && [ "$JSON" = "0" ]; then
+    echo "note: $quiet control(s) produced no visible change — often legitimate"
+    echo "      (a submit with an empty form). Inspect before treating as a bug:"
+    grep "NO RESPONSE" "$raw" | sed 's/^/      /'
+  fi
+  rm -f "$out" "$raw"
+  [ "$n" = "0" ]
+}
+
+# --- oracle on a scenario -------------------------------------------------
+cmd_app() {
+  local url="${1:?usage: verify app <url> [--scenario NAME]}"; shift || true
+  local scen="save-apostrophe"
+  while [ $# -gt 0 ]; do
+    case "$1" in --scenario) scen="${2:?}"; shift 2 ;; *) shift ;; esac
+  done
+  local ws; ws="$(_workspace)" || die "could not build a playwright workspace"
+  local dir; dir="$(mktemp -d)"; local raw; raw="$(mktemp)"
+  QA_WORKSPACE="$ws" "$REPO/qa/bin/qa-run" --url "$url" --scenario "$scen" --out "$dir" >"$raw" 2>&1
+  local bug; bug="$(sed -n 's/.*bug=\([A-Za-z]*\).*/\1/p' "$raw" | tail -1)"
+  local out; out="$(mktemp)"
+  grep -E '^\s+\[' "$raw" >"$out" 2>/dev/null
+  local n; n="$(wc -l <"$out" | tr -d ' ')"
+  if [ -z "$bug" ]; then cat "$raw"; rm -f "$out" "$raw"; rm -rf "$dir"; die "oracle produced no verdict"; fi
+  _emit "$([ "$bug" = "True" ] && echo findings || echo ok)" "$n" "$out" trace "$dir/trace.json"
+  rm -f "$out" "$raw"
+  [ "$bug" != "True" ]
+}
+
+# --- VS Code / VSCodium extension ----------------------------------------
+# The first version launched, took ONE snapshot, and tore the whole session down
+# from its EXIT trap. That made the "drive" half of "drive and observe"
+# impossible: to click something and see the result you had to abandon this tool
+# and hand-replicate its internals. Hence a lifecycle — start once, interact any
+# number of times, stop when done.
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/verify"
+STATE="$STATE_DIR/editor.json"
+
+_state_get() { # key
+  [ -f "$STATE" ] || return 1
+  python3 -c "
+import json, sys
+try: print(json.load(open('$STATE')).get(sys.argv[1], ''))
+except Exception: pass" "$1"
+}
+
+_live_port() {
+  local p="${VERIFY_CDP_PORT:-}"
+  [ -z "$p" ] && p="$(_state_get port 2>/dev/null)"
+  [ -z "$p" ] && return 1
+  curl -sf --max-time 2 "http://127.0.0.1:$p/json/version" >/dev/null 2>&1 || return 1
+  echo "$p"
+}
+
+_need_live() {
+  _live_port || die "no editor is running — start one with: verify editor <ext-dir> --keep"
+}
+
+_teardown_editor() { # session, prof
+  local sess="$1" prof="$2"
+  [ -n "$sess" ] && "$REPO/bin/acu-session" destroy "$sess" >/dev/null 2>&1
+  # Kill by PID, never `pkill -f`: the pattern matches this script's own command
+  # line and kills the caller. That happened three times in one day.
+  python3 - "${prof:-/nonexistent-verify-editor}" <<'PY' 2>/dev/null
+import os, signal, sys, time
+tag = sys.argv[1]
+me = {os.getpid(), os.getppid()}
+def hits():
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) in me: continue
+        try: cl = open("/proc/%s/cmdline" % d, "rb").read().decode("utf8", "replace")
+        except OSError: continue
+        if tag in cl: out.append(int(d))
+    return out
+for p in hits():
+    try: os.kill(p, signal.SIGTERM)
+    except OSError: pass
+time.sleep(2)
+for p in hits():
+    try: os.kill(p, signal.SIGKILL)
+    except OSError: pass
+PY
+  [ -n "$prof" ] && rm -rf "$prof"
+  rm -f "$STATE"
+  return 0
+}
+
+cmd_editor() {
+  local ext="" ws_dir="" keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep|--keep-alive) keep=1; shift ;;
+      *) if [ -z "$ext" ]; then ext="$1"; elif [ -z "$ws_dir" ]; then ws_dir="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$ext" ] || die "usage: verify editor <extension-dir> [workspace] [--keep]"
+  ws_dir="${ws_dir:-$ext}"
+  [ -f "$ext/package.json" ] || die "no package.json in $ext — is that the extension root?"
+  local runner; runner="$(_py_runner)" || die "need uv or the websockets package"
+  have codium || have code || die "no codium/code on PATH"
+  local editor; editor="$(command -v codium || command -v code)"
+
+  # Refuse to strand a previous instance: one CDP port, one editor.
+  if _live_port >/dev/null 2>&1; then
+    die "an editor is already running on port $(_live_port) — 'verify stop' first, or reuse it"
+  fi
+
+  local port="${VERIFY_CDP_PORT:-9333}"
+  # NOT `local`: the EXIT trap fires after this function has returned, so local
+  # variables are already out of scope and, under `set -u`, the trap aborts
+  # before destroying anything. Measured — that leaked a nested compositor, 12
+  # codium processes and the session directory.
+  EDITOR_PROF="$(mktemp -d /tmp/verify-editor-XXXXXX)"
+  EDITOR_SESS="verify-editor-$$"
+  export ACU_STATE_DIR="${ACU_STATE_DIR:-$HOME/.local/share/acu/sessions}"
+
+  # Isolated nested desktop so it never lands on the live one, but with
+  # --host-dialogs: the xdg portal is a HOST service, so a native chooser
+  # appears on the host regardless, and this keeps it reachable by hcu-dialog.
+  "$REPO/bin/acu-session" start --name "$EDITOR_SESS" --size 1600x1000 --host-dialogs >/dev/null \
+    || die "could not start an isolated desktop"
+
+  # Only tear down automatically in one-shot mode. With --keep, a trap would
+  # destroy the very session the caller asked to keep.
+  cleanup_editor() { _teardown_editor "${EDITOR_SESS:-}" "${EDITOR_PROF:-}"; }
+  [ "$keep" = "0" ] && trap cleanup_editor EXIT
+
+  # A dedicated user-data-dir is required, not tidiness: VS Code is
+  # single-instance per data dir, so without it the window joins an existing
+  # instance on the HOST and the nested session stays empty.
+  "$REPO/bin/acu-session" exec "$EDITOR_SESS" -- "$editor" \
+    --user-data-dir "$EDITOR_PROF/user" --extensions-dir "$EDITOR_PROF/ext" \
+    --extensionDevelopmentPath="$ext" --remote-debugging-port="$port" \
+    --disable-workspace-trust --new-window "$ws_dir" >/dev/null 2>&1
+
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    curl -sf --max-time 2 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 && break
+    sleep 1; i=$((i+1))
+  done
+  [ "$i" -ge 40 ] && die "editor did not expose CDP on port $port"
+  sleep 6
+
+  mkdir -p "$STATE_DIR"
+  python3 -c "
+import json, sys
+json.dump({'port': sys.argv[1], 'session': sys.argv[2], 'prof': sys.argv[3], 'ext': sys.argv[4]},
+          open('$STATE', 'w'))" "$port" "$EDITOR_SESS" "$EDITOR_PROF" "$ext"
+
+  cmd_observe
+  if [ "$keep" = "1" ]; then
+    echo
+    echo "editor left running (port $port). Interact, then stop:"
+    echo "  verify click \"<label>\"     verify key ctrl+shift+p"
+    echo "  verify type \"text\"         verify observe"
+    echo "  verify dialog find          verify stop"
+  fi
+}
+
+cmd_observe() {
+  local port; port="$(_need_live)" || exit 2
+  local runner; runner="$(_py_runner)" || die "need uv or the websockets package"
+  $runner "$REPO/qa/bin/qa-vscode" --port "$port" observe 2>&1 | sed -n '/--- CONTROLS ---/,$p'
+}
+
+cmd_click() {
+  local label="${1:?usage: verify click \"<label>\"}"
+  local port; port="$(_need_live)" || exit 2
+  local runner; runner="$(_py_runner)" || die "need uv or the websockets package"
+  $runner "$REPO/qa/bin/qa-vscode" --port "$port" click "$label"
+}
+
+cmd_key() {
+  local chord="${1:?usage: verify key <name|chord>   e.g. Enter, ctrl+shift+p}"
+  local port; port="$(_need_live)" || exit 2
+  local runner; runner="$(_py_runner)" || die "need uv or the websockets package"
+  $runner "$REPO/qa/bin/qa-vscode" --port "$port" key "$chord"
+}
+
+cmd_type() {
+  local text="${1:?usage: verify type <text>}"
+  local port; port="$(_need_live)" || exit 2
+  local runner; runner="$(_py_runner)" || die "need uv or the websockets package"
+  $runner "$REPO/qa/bin/qa-vscode" --port "$port" type "$text"
+}
+
+cmd_stop() {
+  local sess prof
+  sess="$(_state_get session 2>/dev/null)"
+  prof="$(_state_get prof 2>/dev/null)"
+  if [ -z "$sess" ] && [ -z "$prof" ]; then echo "nothing running"; return 0; fi
+  export ACU_STATE_DIR="${ACU_STATE_DIR:-$HOME/.local/share/acu/sessions}"
+  _teardown_editor "$sess" "$prof"
+  echo "stopped"
+}
+
+# --- native dialogs -------------------------------------------------------
+cmd_dialog() { exec "$REPO/bin/hcu-dialog" "$@"; }
+
+# --- replay a saved finding ----------------------------------------------
+cmd_repro() {
+  local repro="${1:?usage: verify repro <repro.json> <url>}" url="${2:?}"
+  local ws; ws="$(_workspace)" || die "could not build a playwright workspace"
+  local raw; raw="$(mktemp)"
+  QA_WORKSPACE="$ws" "$REPO/qa/bin/qa-verify" --repro "$repro" --url "$url" >"$raw" 2>&1
+  # qa-verify exits 0 when the bug REPRODUCES — inverted from every convention,
+  # and a caller assuming 0=healthy reads a live bug as a pass. Normalise here:
+  # this command exits 0 when the app is HEALTHY.
+  if grep -q '^REPRODUCED' "$raw"; then
+    _emit "findings" 1 "$raw"; rm -f "$raw"; return 1
+  fi
+  _emit "ok" 0 /dev/null; rm -f "$raw"; return 0
+}
+
+# ROUTING. A caller who says "test this <thing>" should not have to know which
+# lane it belongs to, so a bare target picks its own: a URL is a running web app
+# (the oracle lane, the one with real discrimination), a directory holding a
+# package.json is a VS Code extension. Anything else is refused with the list —
+# guessing wrong here would silently run a weaker check than the caller wanted.
+_route() {
+  local t="$1"; shift
+  case "$t" in
+    http://*|https://*)
+      echo "routing: URL -> 'verify app' (scenario + oracle)" >&2
+      cmd_app "$t" "$@"; return $? ;;
+  esac
+  if [ -d "$t" ] && [ -f "$t/package.json" ]; then
+    echo "routing: extension directory -> 'verify editor'" >&2
+    cmd_editor "$t" "$@"; return $?
+  fi
+  [ -d "$t" ] && die "'$t' is a directory but has no package.json — not a VS Code extension root.
+     For a running web app pass its URL; see 'verify --help'."
+  die "don't know how to test '$t'.
+     Pass a URL (http://...) for a web app, or an extension directory.
+     Commands: doctor, app, web, editor, observe, click, key, type, stop, dialog, repro."
+}
+
+case "${1:-}" in
+  doctor) shift; cmd_doctor "$@" ;;
+  web)    shift; cmd_web    "$@" ;;
+  app)    shift; cmd_app    "$@" ;;
+  editor)  shift; cmd_editor  "$@" ;;
+  observe) shift; cmd_observe "$@" ;;
+  click)   shift; cmd_click   "$@" ;;
+  key)     shift; cmd_key     "$@" ;;
+  type)    shift; cmd_type    "$@" ;;
+  stop)    shift; cmd_stop    "$@" ;;
+  dialog) shift; cmd_dialog "$@" ;;
+  repro)  shift; cmd_repro  "$@" ;;
+  ""|-h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) _route "$@" ;;
+esac

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# hcu-capture — screenshot the Hyprland desktop, a specific window, or a region,
+# and print the capture geometry + scale so a model can map coordinates back.
+# Reuses the machine's grim approach (omarchy-cmd-screenshot): grim -g with the
+# geometry from `hyprctl monitors -j` / `hyprctl clients -j`.
+#
+#   hcu-capture output            # the focused monitor (default)
+#   hcu-capture full              # every monitor (whole layout)
+#   hcu-capture window <regex>    # first window whose class OR title matches
+#   hcu-capture region            # interactive slurp selection
+#   OUT=/path.png hcu-capture ... # override output (default /tmp/hcu-shot.png)
+#   DOWNSCALE=1024 hcu-capture ... # also write <out>.small.png ~1024px wide (for the model)
+#
+# Prints (stdout): "<out> <x>,<y> <w>x<h> scale=<s>"  — x,y,w,h are the captured
+# region in real desktop pixels; scale is the monitor scale (for HiDPI math).
+set -euo pipefail
+MODE="${1:-output}"; shift || true
+OUT="${OUT:-/tmp/hcu-shot.png}"
+SCALE=1
+
+geo_focused_monitor() {
+  hyprctl monitors -j | jq -r '.[] | select(.focused==true) | "\(.x),\(.y) \((.width/.scale)|floor)x\((.height/.scale)|floor) \(.scale)"'
+}
+
+case "$MODE" in
+  output)
+    read -r XY WH SCALE < <(geo_focused_monitor)
+    GEO="$XY $WH" ;;
+  full)
+    GEO="" ;;  # grim with no -g captures the whole layout
+  window)
+    Q="${1:?usage: hcu-capture window <class-or-title-regex>}"
+    GEO="$(hyprctl clients -j | jq -r --arg q "$Q" '
+      [ .[] | select((.class|test($q)) or (.title|test($q))) ] | .[0] // empty
+      | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')"
+    [ -n "$GEO" ] || { echo "hcu-capture: no window matching /$Q/" >&2; exit 1; } ;;
+  region)
+    GEO="$(slurp)" ;;
+  *) echo "hcu-capture: unknown mode '$MODE' (output|full|window|region)" >&2; exit 2 ;;
+esac
+
+if [ -n "$GEO" ]; then grim -g "$GEO" "$OUT" >/dev/null 2>&1; else grim "$OUT" >/dev/null 2>&1; fi
+
+if [ -n "${DOWNSCALE:-}" ] && command -v magick >/dev/null 2>&1; then
+  magick "$OUT" -resize "${DOWNSCALE}x" "${OUT%.png}.small.png" 2>/dev/null || true
+fi
+echo "$OUT ${GEO:-full} scale=${SCALE:-1}"

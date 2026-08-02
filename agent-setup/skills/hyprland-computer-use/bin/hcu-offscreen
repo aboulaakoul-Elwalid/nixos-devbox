@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# hcu-offscreen — run any GUI app in a HEADLESS cage compositor and screenshot it
+# with grim, WITHOUT anything appearing on the live Hyprland session. This is the
+# non-intrusive way to visually test an app (Electron/VSCodium/any wlroots client)
+# in a script or CI. Verified pattern (NousResearch/hermes-agent: cage+grim+Electron).
+#
+#   hcu-offscreen <out.png> -- <cmd> [args...]
+#   WAIT=14 hcu-offscreen /tmp/app.png -- codium --ozone-platform=wayland <ws>
+#
+# cage runs one client fullscreen on an isolated XDG_RUNTIME_DIR; we point grim at
+# cage's own wayland socket. Electron apps need --ozone-platform=wayland
+# --disable-gpu (avoids the headless DMABUF black-frame). weston/mutter are NOT
+# supported here (grim needs wlr-screencopy; cage/sway/labwc provide it).
+set -euo pipefail
+OUT="${1:?usage: hcu-offscreen <out.png> -- <cmd> [args...]}"; shift
+[ "${1:-}" = "--" ] && shift
+[ "$#" -gt 0 ] || { echo "hcu-offscreen: no command after --" >&2; exit 2; }
+command -v cage >/dev/null || { echo "hcu-offscreen: cage not installed (nix profile install nixpkgs#cage)" >&2; exit 2; }
+
+RT="$(mktemp -d /tmp/hcu-cage-XXXXXX)"; chmod 700 "$RT"
+export XDG_RUNTIME_DIR="$RT"
+export WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
+
+cage -- "$@" >"$RT/cage.log" 2>&1 &
+CAGE=$!
+for _ in $(seq 1 30); do
+  SOCK="$(ls "$RT"/wayland-* 2>/dev/null | grep -v '\.lock' | head -1)"
+  [ -n "$SOCK" ] && break; sleep 0.5
+done
+[ -n "${SOCK:-}" ] || { echo "hcu-offscreen: cage produced no wayland socket" >&2; cat "$RT/cage.log" >&2; kill $CAGE 2>/dev/null; exit 1; }
+export WAYLAND_DISPLAY="$(basename "$SOCK")"
+sleep "${WAIT:-12}"
+grim "$OUT" 2>"$RT/grim.log" || { echo "hcu-offscreen: grim failed" >&2; cat "$RT/grim.log" >&2; kill $CAGE 2>/dev/null; exit 1; }
+kill $CAGE 2>/dev/null; wait $CAGE 2>/dev/null || true
+echo "$OUT ($(stat -c%s "$OUT" 2>/dev/null) bytes, socket $WAYLAND_DISPLAY)"

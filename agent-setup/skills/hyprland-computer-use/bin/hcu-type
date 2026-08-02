@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# hcu-type — type text or press keys into the FOCUSED window (Wayland
+# virtual-keyboard via wtype; no window targeting — focus first with hcu-window).
+#
+#   hcu-type "some text"          # type a literal string (SAFE chunked path)
+#   hcu-type -k Return            # press a named key (Return, Tab, Escape, ...)
+#   hcu-type -M ctrl -k c -m ctrl # modifiers: -M press, -m release
+#   hcu-type --paste "long text"  # clipboard route (needs app paste binding)
+#   hcu-type --strategy perchar "x"
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS NOT A BARE `exec wtype`  (measured 2026-07-28, Hyprland 0.54.3)
+#
+# wtype silently corrupts long strings. It builds a temporary virtual-keyboard
+# keymap for the text it is given, and from roughly the 14th character position
+# onward, characters that require Shift resolve to the WRONG key — most often
+# Tab (keycode 23). It still exits 0, so callers see success.
+#
+#   wtype "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+#     -> ABCDEFGHIJKLM<TAB>PQRSTUVWXYZ          (N and O eaten)
+#   wtype 'a!@#$%^&*()_+{}|:"<>?'
+#     -> a!@#$%^&*()_+<TAB>|:"<>?                ({ and } eaten)
+#
+# Measured (raw wtype, into a shell-free `cat` sink, nested + host alike):
+#   "abcdefghijklmnopqrstuvwxyz"  (26 chars, no shift)  -> clean
+#   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  (26 chars, shifted)   -> CORRUPT at pos 14
+#   "abcdefghijklmn"              (14 chars, no shift)  -> clean
+#   "ABCDEFGHIJKLMN"              (14 chars, shifted)   -> CORRUPT (N dropped)
+#   "ABCDEFGHIJKLM"               (13 chars, shifted)   -> clean
+#   80 chars of "ab"                                    -> clean
+#   `wtype -d <delay>`            -> does NOT help (keymap bug, not a rate race)
+#   one wtype call per character  -> clean
+#   clipboard paste               -> clean
+#
+# NOTE: the trigger is NOT the number of distinct characters — 36 distinct
+# lowercase+digit characters type cleanly, while 14 uppercase ones do not. Every
+# corruption observed landed at character POSITION 14 or later. The exact
+# upstream mechanism is not fully characterised.
+#
+# Fix: never let a single wtype invocation exceed HCU_TYPE_MAX_CHUNK (default
+# 13) characters, so no call can reach the position where corruption begins.
+# This is conservative by construction and far faster than per-character typing.
+#
+# `--strategy paste` avoids the virtual keyboard entirely, but it is NOT a
+# universal guarantee: it depends on the target application's paste keybinding
+# (a terminal may forward Ctrl+Shift+V as an escape sequence instead of
+# pasting), and it briefly places the text on the clipboard. Use it when you
+# know the target app's paste binding; otherwise the default chunked path.
+#
+# Regression test: computer_use/test/test-hcu-type.sh
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+command -v wtype >/dev/null || { echo "hcu-type: wtype not installed" >&2; exit 2; }
+
+MAX_CHUNK="${HCU_TYPE_MAX_CHUNK:-13}"
+STRATEGY="${HCU_TYPE_STRATEGY:-chunk}"   # chunk | perchar | paste
+PASTE_KEYS="${HCU_TYPE_PASTE_KEYS:-ctrl shift v}"
+
+# --- option parsing -------------------------------------------------------
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --paste)        STRATEGY="paste"; shift ;;
+    --strategy)     STRATEGY="${2:?--strategy needs a value}"; shift 2 ;;
+    --max-chunk)    MAX_CHUNK="${2:?--max-chunk needs a value}"; shift 2 ;;
+    --) shift; ARGS+=("$@"); break ;;
+    *)  ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS+"${ARGS[@]}"}
+
+[ $# -eq 0 ] && { echo "hcu-type: nothing to type" >&2; exit 2; }
+
+# Key/modifier invocations (-k/-M/-m/-s/-d/-P/-p) press single keys and never
+# build a multi-character keymap, so they are safe to pass straight through.
+for a in "$@"; do
+  case "$a" in
+    -k|-M|-m|-s|-d|-P|-p) exec wtype "$@" ;;
+  esac
+done
+
+# Anything else is literal text. Refuse multiple positional strings rather than
+# silently concatenating them with a space.
+if [ $# -gt 1 ]; then
+  echo "hcu-type: expected a single text argument, got $#. Quote the string." >&2
+  exit 2
+fi
+TEXT="$1"
+[ -z "$TEXT" ] && exit 0
+
+# --- strategies -----------------------------------------------------------
+# Both the chunked and per-character paths run through one python emitter.
+#
+# It lives in python, not bash, because:
+#   * command substitution silently discards NUL bytes, so a separator-joined
+#     chunk list cannot survive a bash round-trip;
+#   * wtype has NO option terminator (`--` is typed literally, not honoured), so
+#     arguments must be passed as a real argv array;
+#   * an argument starting with '-' is parsed as a flag and silently types
+#     nothing, so leading dashes are sent as `-k minus` key presses instead.
+type_via_python() { # $1 = chunk | perchar
+  printf '%s' "$TEXT" | MAXC="$MAX_CHUNK" MODE="$1" python3 -c '
+import os, sys, subprocess
+
+text = sys.stdin.read()
+maxc = max(1, int(os.environ["MAXC"]))
+mode = os.environ.get("MODE", "chunk")
+
+def wt(args):
+    r = subprocess.run(["wtype"] + args)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+
+def emit(s):
+    # A leading "-" is parsed by wtype as a flag and silently types nothing.
+    while s.startswith("-"):
+        wt(["-k", "minus"])
+        s = s[1:]
+    if s:
+        wt([s])
+
+if mode == "perchar":
+    chunks = list(text)
+else:
+    # Keep every wtype call short enough that it cannot reach the character
+    # position where the keymap corruption begins.
+    chunks = [text[i:i + maxc] for i in range(0, len(text), maxc)]
+
+for c in chunks:
+    emit(c)
+' || { echo "hcu-type: typing failed" >&2; exit 3; }
+}
+
+type_paste() {
+  command -v wl-copy >/dev/null || { echo "hcu-type: wl-copy not installed" >&2; exit 2; }
+  local saved rc=0 tok
+  saved="$(wl-paste --no-newline 2>/dev/null || true)"
+  printf '%s' "$TEXT" | wl-copy
+
+  # PASTE_KEYS is "mod... key", e.g. "ctrl shift v" -> -M ctrl -M shift -k v -m shift -m ctrl
+  local all=() mods=() key=""
+  for tok in $PASTE_KEYS; do all+=("$tok"); done
+  key="${all[$(( ${#all[@]} - 1 ))]}"
+  local n=$(( ${#all[@]} - 1 )) i
+  for (( i=0; i<n; i++ )); do mods+=("${all[$i]}"); done
+
+  local cmd=(wtype)
+  for (( i=0; i<n; i++ )); do cmd+=(-M "${mods[$i]}"); done
+  cmd+=(-k "$key")
+  for (( i=n-1; i>=0; i-- )); do cmd+=(-m "${mods[$i]}"); done
+
+  "${cmd[@]}" || rc=$?
+  sleep 0.15
+  # restore the user's clipboard rather than leaving our payload in it
+  if [ -n "$saved" ]; then printf '%s' "$saved" | wl-copy
+  else wl-copy --clear 2>/dev/null || true; fi
+  return $rc
+}
+
+case "$STRATEGY" in
+  chunk)   type_via_python chunk ;;
+  perchar) type_via_python perchar ;;
+  paste)   type_paste ;;
+  *) echo "hcu-type: unknown strategy '$STRATEGY' (chunk|perchar|paste)" >&2; exit 2 ;;
+esac

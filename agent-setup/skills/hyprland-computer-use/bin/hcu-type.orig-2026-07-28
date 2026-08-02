@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# hcu-type — type text or press keys into the FOCUSED window (Wayland
+# virtual-keyboard via wtype; no window targeting — focus first with hcu-window).
+#
+#   hcu-type "some text"          # type a literal string
+#   hcu-type -k Return            # press a named key (Return, Tab, Escape, ...)
+#   hcu-type -M ctrl -k c -m ctrl # modifiers: -M press, -m release
+#
+# All args are passed straight through to wtype, so its full syntax is available.
+set -euo pipefail
+command -v wtype >/dev/null || { echo "hcu-type: wtype not installed" >&2; exit 2; }
+exec wtype "$@"

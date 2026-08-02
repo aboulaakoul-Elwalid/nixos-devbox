@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Security"
+  short_description: "Run and interpret Codex Security CLI scans safely."
+  default_prompt: "Use $codex-security to scan this repository, review findings, and propose a small verified remediation plan."
+
+policy:
+  allow_implicit_invocation: true

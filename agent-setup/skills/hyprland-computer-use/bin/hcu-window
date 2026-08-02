@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# hcu-window — discover and target windows on Hyprland (for click coordinates and
+# focus). Geometry is what makes absolute clicks possible: a button's on-screen
+# pixel = window origin (.at[]) + its offset inside the window.
+#
+#   hcu-window list                  # every window: class · title · x,y · WxH · focused
+#   hcu-window geo <class-or-title>  # "x,y WxH" of the first match (for hcu-capture/click math)
+#   hcu-window focus <class-or-title># bring the first match forward (activatewindow)
+#   hcu-window active                # the focused window's class/title/geometry
+set -euo pipefail
+CMD="${1:-list}"; Q="${2:-}"
+
+case "$CMD" in
+  list)
+    hyprctl clients -j | jq -r '.[] | select(.mapped==true) |
+      "\(.class)\t\(.title)\t\(.at[0]),\(.at[1])\t\(.size[0])x\(.size[1])\t\(if .focusHistoryID==0 then "focused" else "" end)"' \
+      | column -t -s $'\t' ;;
+  geo)
+    [ -n "$Q" ] || { echo "usage: hcu-window geo <regex>" >&2; exit 2; }
+    hyprctl clients -j | jq -r --arg q "$Q" '
+      [ .[] | select((.class|test($q)) or (.title|test($q))) ] | .[0] // empty
+      | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"' ;;
+  focus)
+    [ -n "$Q" ] || { echo "usage: hcu-window focus <regex>" >&2; exit 2; }
+    ADDR="$(hyprctl clients -j | jq -r --arg q "$Q" '[ .[] | select((.class|test($q)) or (.title|test($q))) ] | .[0].address // empty')"
+    [ -n "$ADDR" ] || { echo "hcu-window: no window matching /$Q/" >&2; exit 1; }
+    hyprctl dispatch focuswindow "address:$ADDR" >/dev/null && echo "focused $ADDR" ;;
+  active)
+    hyprctl activewindow -j | jq -r '"\(.class)\t\(.title)\t\(.at[0]),\(.at[1])\t\(.size[0])x\(.size[1])"' ;;
+  *) echo "hcu-window: unknown cmd '$CMD' (list|geo|focus|active)" >&2; exit 2 ;;
+esac

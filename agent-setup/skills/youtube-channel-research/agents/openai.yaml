@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTube Channel Research"
+  short_description: "Crawl channels and cross-analyze their claims"
+  default_prompt: "Use $youtube-channel-research to ingest these YouTube channels and compare their transcript evidence with my context."

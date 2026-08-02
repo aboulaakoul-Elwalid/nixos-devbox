@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# hcu-click — click at an ABSOLUTE desktop pixel on Hyprland.
+#
+# Wayland has no global input injection; the working combo (verified on Hyprland
+# 0.54) is: move the cursor with Hyprland's own IPC, then press with wlrctl's
+# virtual-pointer (unprivileged, no /dev/uinput). Neither tool does absolute-click
+# alone — hyprctl moves but can't click, wlrctl clicks but only moves relative.
+#
+#   hcu-click <x> <y> [left|right|middle]     # default left
+#   hcu-move  <x> <y>                          # move only (via hcu-move symlink)
+#
+# x,y are REAL desktop pixels. If your model saw a downscaled screenshot, scale
+# the point back up first: real = model * (capture_w / small_w). On HiDPI, the
+# hcu-capture `scale=` field already reports logical pixels, so no extra math.
+set -euo pipefail
+X="${1:?usage: hcu-click <x> <y> [button]}"
+Y="${2:?usage: hcu-click <x> <y> [button]}"
+BTN="${3:-left}"
+hyprctl dispatch movecursor "$X" "$Y" >/dev/null
+# small settle so the compositor applies the move before the press
+sleep 0.05
+case "$(basename "$0")" in
+  hcu-move) exit 0 ;;
+esac
+wlrctl pointer click "$BTN"
