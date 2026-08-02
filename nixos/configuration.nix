@@ -229,10 +229,6 @@ in
     git
     ghostty
     kitty
-    xdg-terminal-exec  # not in the source machine's declared packages either
-                       # (elwalid has a manual copy at ~/.local/bin) -- needed
-                       # by hypr/bindings.conf's tmux binding and
-                       # omarchy-launch-tui (btop, etc). Real nixpkgs package.
     brave
     chromium
     xdg-utils
